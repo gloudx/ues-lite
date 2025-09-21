@@ -1,11 +1,13 @@
 package datastore
+
 import (
 	"context"
-	"time"
-	ds "github.com/ipfs/go-datastore"	
-	"github.com/ipfs/go-datastore/query"	
-	badger4 "github.com/ipfs/go-ds-badger4"	
+
+	ds "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore/query"
+	badger4 "github.com/ipfs/go-ds-badger4"
 )
+
 type Datastore interface {
 	ds.Datastore
 	ds.BatchingFeature
@@ -18,19 +20,23 @@ type Datastore interface {
 	Clear(ctx context.Context) error
 	Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <-chan error, error)
 }
+
 type KeyValue struct {
-	Key	ds.Key	
-	Value	[]byte	
+	Key   ds.Key
+	Value []byte
 }
-var _ ds.Datastore = (*datastorage)(nil)		
-var _ ds.PersistentDatastore = (*datastorage)(nil)	
-var _ ds.TxnDatastore = (*datastorage)(nil)		
-var _ ds.TTLDatastore = (*datastorage)(nil)		
-var _ ds.GCDatastore = (*datastorage)(nil)		
-var _ ds.Batching = (*datastorage)(nil)			
+
+var _ ds.Datastore = (*datastorage)(nil)
+var _ ds.PersistentDatastore = (*datastorage)(nil)
+var _ ds.TxnDatastore = (*datastorage)(nil)
+var _ ds.TTLDatastore = (*datastorage)(nil)
+var _ ds.GCDatastore = (*datastorage)(nil)
+var _ ds.Batching = (*datastorage)(nil)
+
 type datastorage struct {
-	*badger4.Datastore	
+	*badger4.Datastore
 }
+
 func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 	badgerDS, err := badger4.NewDatastore(path, opts)
 	if err != nil {
@@ -38,10 +44,11 @@ func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 	}
 	return &datastorage{Datastore: badgerDS}, nil
 }
+
 func (s *datastorage) Iterator(ctx context.Context, prefix ds.Key, keysOnly bool) (<-chan KeyValue, <-chan error, error) {
 	q := query.Query{
-		Prefix:		prefix.String(),
-		KeysOnly:	keysOnly,
+		Prefix:   prefix.String(),
+		KeysOnly: keysOnly,
 	}
 	result, err := s.Datastore.Query(ctx, q)
 	if err != nil {
@@ -67,14 +74,15 @@ func (s *datastorage) Iterator(ctx context.Context, prefix ds.Key, keysOnly bool
 					return
 				}
 				out <- KeyValue{
-					Key:	ds.NewKey(res.Key),
-					Value:	res.Value,
+					Key:   ds.NewKey(res.Key),
+					Value: res.Value,
 				}
 			}
 		}
 	}()
 	return out, errc, nil
 }
+
 func (s *datastorage) Merge(ctx context.Context, other Datastore) error {
 	batch, err := s.Batch(ctx)
 	if err != nil {
@@ -103,6 +111,7 @@ func (s *datastorage) Merge(ctx context.Context, other Datastore) error {
 		}
 	}
 }
+
 func (s *datastorage) Clear(ctx context.Context) error {
 	q, err := s.Query(ctx, query.Query{
 		KeysOnly: true,
@@ -132,10 +141,11 @@ func (s *datastorage) Clear(ctx context.Context) error {
 		}
 	}
 }
+
 func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <-chan error, error) {
 	q := query.Query{
-		Prefix:		prefix.String(),
-		KeysOnly:	true,
+		Prefix:   prefix.String(),
+		KeysOnly: true,
 	}
 	result, err := s.Datastore.Query(ctx, q)
 	if err != nil {
@@ -165,22 +175,4 @@ func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <
 		}
 	}()
 	return out, errc, nil
-}
-func (s *datastorage) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
-	if ttl <= 0 {
-		return s.Datastore.Put(ctx, key, value)
-	}
-	return s.Datastore.PutWithTTL(ctx, key, value, ttl)
-}
-func (s *datastorage) SetTTL(ctx context.Context, key ds.Key, ttl time.Duration) error {
-	if ttl <= 0 {
-		return s.Datastore.SetTTL(ctx, key, 0)
-	}
-	return s.Datastore.SetTTL(ctx, key, ttl)
-}
-func (s *datastorage) GetExpiration(ctx context.Context, key ds.Key) (time.Time, error) {
-	return s.Datastore.GetExpiration(ctx, key)
-}
-func (s *datastorage) Close() error {
-	return s.Datastore.Close()
 }

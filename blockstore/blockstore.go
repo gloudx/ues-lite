@@ -7,7 +7,6 @@ import (
 	"sync"
 	s "ues-lite/datastore"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/boxo/blockservice"
 	bstor "github.com/ipfs/boxo/blockstore"
 	chunker "github.com/ipfs/boxo/chunker"
@@ -16,7 +15,6 @@ import (
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	imp "github.com/ipfs/boxo/ipld/unixfs/importer"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
-	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	format "github.com/ipfs/go-ipld-format"
 	carv2 "github.com/ipld/go-car/v2"
@@ -63,14 +61,14 @@ type Blockstore interface {
 	ExportCARV2(ctx context.Context, root cid.Cid, selectorNode datamodel.Node, w io.Writer, opts ...carv2.WriteOption) error
 	ImportCARV2(ctx context.Context, r io.Reader, opts ...carv2.ReadOption) ([]cid.Cid, error)
 }
+
 type blockstore struct {
 	ds s.Datastore
 	bstor.Blockstore
-	lsys  *linking.LinkSystem
-	bS    blockservice.BlockService
-	dS    format.DAGService
-	mu    sync.RWMutex
-	cache *lru.Cache[string, blocks.Block]
+	lsys *linking.LinkSystem
+	bS   blockservice.BlockService
+	dS   format.DAGService
+	mu   sync.RWMutex
 }
 
 var _ Blockstore = (*blockstore)(nil)
@@ -81,8 +79,6 @@ func NewBlockstore(ds s.Datastore) *blockstore {
 		ds:         ds,
 		Blockstore: base,
 	}
-	cache, _ := lru.New[string, blocks.Block](1000)
-	bs.cache = cache
 	bs.mu = sync.RWMutex{}
 	bs.bS = blockservice.New(bs.Blockstore, nil)
 	bs.dS = merkledag.NewDAGService(bs.bS)
@@ -93,60 +89,7 @@ func NewBlockstore(ds s.Datastore) *blockstore {
 	bs.lsys = &lS
 	return bs
 }
-func (bs *blockstore) cacheBlock(b blocks.Block) {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	if bs.cache == nil {
-		return
-	}
-	bs.cache.Add(b.Cid().String(), b)
-}
-func (bs *blockstore) cacheGet(key string) (blocks.Block, bool) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-	if bs.cache == nil {
-		return nil, false
-	}
-	return bs.cache.Get(key)
-}
-func (bs *blockstore) Put(ctx context.Context, block blocks.Block) error {
-	if err := bs.Blockstore.Put(ctx, block); err != nil {
-		return err
-	}
-	bs.cacheBlock(block)
-	return nil
-}
-func (bs *blockstore) PutMany(ctx context.Context, blks []blocks.Block) error {
-	if err := bs.Blockstore.PutMany(ctx, blks); err != nil {
-		return err
-	}
-	for _, b := range blks {
-		bs.cacheBlock(b)
-	}
-	return nil
-}
-func (bs *blockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) {
-	if blk, ok := bs.cacheGet(c.String()); ok {
-		return blk, nil
-	}
-	blk, err := bs.Blockstore.Get(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-	bs.cacheBlock(blk)
-	return blk, nil
-}
-func (bs *blockstore) DeleteBlock(ctx context.Context, c cid.Cid) error {
-	if err := bs.Blockstore.DeleteBlock(ctx, c); err != nil {
-		return err
-	}
-	bs.mu.Lock()
-	if bs.cache != nil {
-		bs.cache.Remove(c.String())
-	}
-	bs.mu.Unlock()
-	return nil
-}
+
 func (bs *blockstore) PutNode(ctx context.Context, n datamodel.Node) (cid.Cid, error) {
 	if bs.lsys == nil {
 		return cid.Undef, errors.New("links system is nil")
@@ -158,6 +101,7 @@ func (bs *blockstore) PutNode(ctx context.Context, n datamodel.Node) (cid.Cid, e
 	c := lnk.(cidlink.Link).Cid
 	return c, nil
 }
+
 func (bs *blockstore) GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, error) {
 	if bs.lsys == nil {
 		return nil, errors.New("link system is nil")
@@ -165,6 +109,7 @@ func (bs *blockstore) GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, e
 	lnk := cidlink.Link{Cid: c}
 	return bs.lsys.Load(ipld.LinkContext{Ctx: ctx}, lnk, basicnode.Prototype.Any)
 }
+
 func (bs *blockstore) AddFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error) {
 	var spl chunker.Splitter
 	if useRabin {
@@ -178,6 +123,7 @@ func (bs *blockstore) AddFile(ctx context.Context, data io.Reader, useRabin bool
 	}
 	return nd.Cid(), nil
 }
+
 func (bs *blockstore) GetFile(ctx context.Context, c cid.Cid) (files.Node, error) {
 	nd, err := bs.dS.Get(ctx, c)
 	if err != nil {
@@ -185,6 +131,7 @@ func (bs *blockstore) GetFile(ctx context.Context, c cid.Cid) (files.Node, error
 	}
 	return unixfile.NewUnixfsFile(ctx, bs.dS, nd)
 }
+
 func (bs *blockstore) GetReader(ctx context.Context, c cid.Cid) (io.ReadSeekCloser, error) {
 	nd, err := bs.dS.Get(ctx, c)
 	if err != nil {
@@ -192,6 +139,7 @@ func (bs *blockstore) GetReader(ctx context.Context, c cid.Cid) (io.ReadSeekClos
 	}
 	return ufsio.NewDagReader(ctx, nd, bs.dS)
 }
+
 func (bs *blockstore) View(ctx context.Context, id cid.Cid, callback func([]byte) error) error {
 	if v, ok := bs.Blockstore.(bstor.Viewer); ok {
 		return v.View(ctx, id, callback)
@@ -202,6 +150,7 @@ func (bs *blockstore) View(ctx context.Context, id cid.Cid, callback func([]byte
 	}
 	return callback(blk.RawData())
 }
+
 func BuildSelectorNodeExploreAll() datamodel.Node {
 	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
 	return sb.
@@ -209,9 +158,7 @@ func BuildSelectorNodeExploreAll() datamodel.Node {
 			sb.ExploreAll(sb.ExploreRecursiveEdge()),
 		).Node()
 }
-func CompileSelector(n datamodel.Node) (selector.Selector, error) {
-	return selector.CompileSelector(n)
-}
+
 func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p traversal.Progress, n datamodel.Node) error) error {
 	if bs.lsys == nil {
 		return errors.New("link system is nil")
@@ -221,7 +168,7 @@ func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p trave
 		return err
 	}
 	spec := BuildSelectorNodeExploreAll()
-	sel, err := CompileSelector(spec)
+	sel, err := selector.CompileSelector(spec)
 	if err != nil {
 		return err
 	}
@@ -233,9 +180,11 @@ func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p trave
 	}
 	return traversal.Progress{Cfg: &cfg}.WalkMatching(start, sel, visit)
 }
+
 func (bs *blockstore) Close() error {
 	return nil
 }
+
 func BuildSelectorExploreAll() (selector.Selector, error) {
 	ssb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
 	spec := ssb.ExploreRecursive(selector.RecursionLimitNone(),
@@ -243,12 +192,13 @@ func BuildSelectorExploreAll() (selector.Selector, error) {
 	).Node()
 	return selector.CompileSelector(spec)
 }
+
 func (bs *blockstore) GetSubgraph(ctx context.Context, root cid.Cid, selectorNode datamodel.Node) ([]cid.Cid, error) {
 	start, err := bs.lsys.Load(ipld.LinkContext{Ctx: ctx}, cidlink.Link{Cid: root}, basicnode.Prototype.Any)
 	if err != nil {
 		return nil, err
 	}
-	sel, err := CompileSelector(selectorNode)
+	sel, err := selector.CompileSelector(selectorNode)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +220,7 @@ func (bs *blockstore) GetSubgraph(ctx context.Context, root cid.Cid, selectorNod
 	})
 	return out, err
 }
+
 func (bs *blockstore) Prefetch(ctx context.Context, root cid.Cid, selectorNode datamodel.Node, workers int) error {
 	if workers <= 0 {
 		workers = 8
@@ -302,6 +253,7 @@ func (bs *blockstore) Prefetch(ctx context.Context, root cid.Cid, selectorNode d
 	wg.Wait()
 	return ctx.Err()
 }
+
 func (bs *blockstore) ExportCARV2(ctx context.Context, root cid.Cid, selectorNode datamodel.Node, w io.Writer, opts ...carv2.WriteOption) error {
 	if bs.lsys == nil {
 		return errors.New("link system is nil")
@@ -313,6 +265,7 @@ func (bs *blockstore) ExportCARV2(ctx context.Context, root cid.Cid, selectorNod
 	_, err = writer.WriteTo(w)
 	return err
 }
+
 func (bs *blockstore) ImportCARV2(ctx context.Context, r io.Reader, opts ...carv2.ReadOption) ([]cid.Cid, error) {
 	br, err := carv2.NewBlockReader(r, opts...)
 	if err != nil {
@@ -337,6 +290,7 @@ func (bs *blockstore) ImportCARV2(ctx context.Context, r io.Reader, opts ...carv
 		}
 	}
 }
+
 func (bs *blockstore) Datastore() s.Datastore {
 	return bs.ds
 }

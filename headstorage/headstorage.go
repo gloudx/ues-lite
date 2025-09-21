@@ -1,12 +1,15 @@
 package headstorage
+
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
+
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 )
+
 type HeadStorage interface {
 	LoadHead(ctx context.Context, repoID string) (RepositoryState, error)
 	SaveHead(ctx context.Context, repoID string, state RepositoryState) error
@@ -14,21 +17,22 @@ type HeadStorage interface {
 	Close() error
 }
 type RepositoryState struct {
-	Head	cid.Cid	`json:"head"`
-	Prev	cid.Cid	`json:"prev"`
-	RootIndex	cid.Cid	`json:"root"`
-	Version	int	`json:"version"`
-	RepoID	string	`json:"repo_id"`
+	Head      cid.Cid `json:"head"`
+	Prev      cid.Cid `json:"prev"`
+	RootIndex cid.Cid `json:"root"`
+	Version   int     `json:"version"`
+	RepoID    string  `json:"repo_id"`
 }
 type datastoreHeadStorage struct {
-	ds	ds.Datastore
-	watchers	map[string][]chan RepositoryState
-	mu	sync.RWMutex
+	ds       ds.Datastore
+	watchers map[string][]chan RepositoryState
+	mu       sync.RWMutex
 }
+
 func NewHeadStorage(store ds.Datastore) HeadStorage {
 	return &datastoreHeadStorage{
-		ds:		store,
-		watchers:	make(map[string][]chan RepositoryState),
+		ds:       store,
+		watchers: make(map[string][]chan RepositoryState),
 	}
 }
 func (h *datastoreHeadStorage) LoadHead(ctx context.Context, repoID string) (RepositoryState, error) {
@@ -37,10 +41,10 @@ func (h *datastoreHeadStorage) LoadHead(ctx context.Context, repoID string) (Rep
 	if err != nil {
 		if err == ds.ErrNotFound {
 			return RepositoryState{
-				Head:		cid.Undef,
-				Prev:		cid.Undef,
-				Version:	1,
-				RepoID:		repoID,
+				Head:    cid.Undef,
+				Prev:    cid.Undef,
+				Version: 1,
+				RepoID:  repoID,
 			}, nil
 		}
 		return RepositoryState{}, fmt.Errorf("failed to load head state: %w", err)

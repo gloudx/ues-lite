@@ -82,7 +82,8 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 	if err != nil {
 		return cid.Undef, fmt.Errorf("store record node: %w", err)
 	}
-	if _, err := r.index.Put(ctx, collection, rkey, valueCID); err != nil {
+	headCid, err := r.index.Put(ctx, collection, rkey, valueCID)
+	if err != nil {
 		return cid.Undef, err
 	}
 	if r.sqliteIndex != nil {
@@ -90,6 +91,7 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 			fmt.Printf("Warning: SQLite indexing failed for %s/%s: %v\n", collection, rkey, err)
 		}
 	}
+	r.Head = headCid
 	if err := r.Commit(ctx); err != nil {
 		return cid.Undef, fmt.Errorf("commit after put record: %w", err)
 	}
