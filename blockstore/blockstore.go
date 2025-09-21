@@ -3,6 +3,7 @@ package blockstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	s "ues-lite/datastore"
@@ -151,12 +152,74 @@ func (bs *blockstore) View(ctx context.Context, id cid.Cid, callback func([]byte
 	return callback(blk.RawData())
 }
 
+func _BuildSelectorNodeExploreAll() datamodel.Node {
+	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+	return sb.ExploreRecursive(
+		selector.RecursionLimitNone(),
+		sb.ExploreAll(
+			sb.ExploreRecursiveEdge(),
+		),
+	).Node()
+}
+
 func BuildSelectorNodeExploreAll() datamodel.Node {
 	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
-	return sb.
-		ExploreRecursive(selector.RecursionLimitNone(),
-			sb.ExploreAll(sb.ExploreRecursiveEdge()),
-		).Node()
+	return sb.ExploreRecursive(
+		selector.RecursionLimitDepth(50),
+		sb.ExploreUnion(
+			sb.ExploreAll(sb.ExploreRecursiveEdge()), // Все поля/индексы
+			sb.Matcher(),                             // Текущий узел
+		),
+	).Node()
+}
+
+func BuildSelectorNodeSimple() datamodel.Node {
+	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+	// Простой селектор - выбрать текущий узел
+	return sb.Matcher().Node()
+}
+
+func BuildSelectorNodeExploreFields() datamodel.Node {
+	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+	return sb.ExploreAll(sb.Matcher()).Node()
+}
+
+func BuildSelectorNodeExploreIPFS() datamodel.Node {
+	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+	return sb.ExploreRecursive(
+		selector.RecursionLimitDepth(50),
+		sb.ExploreFields(func(efsb selb.ExploreFieldsSpecBuilder) {
+			// Исследуем все поля
+			efsb.Insert("Links", sb.ExploreAll(
+				sb.ExploreFields(func(linkBuilder selb.ExploreFieldsSpecBuilder) {
+					linkBuilder.Insert("Hash", sb.ExploreRecursiveEdge())
+				}),
+			))
+			efsb.Insert("Data", sb.Matcher())
+		}),
+	).Node()
+}
+
+func _BuildSelectorNodeExploreIPFS() datamodel.Node {
+	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+	return sb.ExploreRecursive(
+		selector.RecursionLimitDepth(100), // Разумное ограничение
+		sb.ExploreUnion(
+			// Исследуем поле Links
+			sb.ExploreFields(func(efsb selb.ExploreFieldsSpecBuilder) {
+				efsb.Insert("Links", sb.ExploreAll(
+					sb.ExploreFields(func(linkFieldsBuilder selb.ExploreFieldsSpecBuilder) {
+						// В каждом элементе Links ищем поле Hash (ссылка)
+						linkFieldsBuilder.Insert("Hash", sb.ExploreRecursiveEdge())
+					}),
+				))
+				// Также можем обработать Data
+				efsb.Insert("Data", sb.Matcher())
+			}),
+			// Matcher для текущего узла
+			sb.Matcher(),
+		),
+	).Node()
 }
 
 func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p traversal.Progress, n datamodel.Node) error) error {
@@ -165,20 +228,34 @@ func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p trave
 	}
 	start, err := bs.lsys.Load(ipld.LinkContext{Ctx: ctx}, cidlink.Link{Cid: root}, basicnode.Prototype.Any)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load root node: %w", err)
 	}
-	spec := BuildSelectorNodeExploreAll()
+	var spec datamodel.Node
+	if start.Kind() == datamodel.Kind_Map {
+		if _, err := start.LookupByString("Links"); err == nil {
+			// UnixFS DAG
+			spec = BuildSelectorNodeExploreIPFS()
+		} else {
+			// Обычный CBOR/JSON DAG
+			spec = BuildSelectorNodeExploreAll()
+		}
+	} else {
+		// Raw или список
+		spec = BuildSelectorNodeSimple()
+	}
 	sel, err := selector.CompileSelector(spec)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to compile selector: %w", err)
 	}
 	cfg := traversal.Config{
+		Ctx:        ctx,
 		LinkSystem: *bs.lsys,
 		LinkTargetNodePrototypeChooser: func(ipld.Link, ipld.LinkContext) (datamodel.NodePrototype, error) {
 			return basicnode.Prototype.Any, nil
 		},
 	}
-	return traversal.Progress{Cfg: &cfg}.WalkMatching(start, sel, visit)
+	prog := traversal.Progress{Cfg: &cfg}
+	return prog.WalkMatching(start, sel, visit)
 }
 
 func (bs *blockstore) Close() error {

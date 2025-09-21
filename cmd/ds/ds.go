@@ -16,17 +16,24 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+const (
+	DefaultDataDir = "./.data"
+	AppName        = "ds-cli"
+	AppVersion     = "1.0.0"
+)
+
 func main() {
 	app := &cli.App{
-		Name:    "datastore-cli",
+		Name:    AppName,
 		Usage:   "Утилита для работы с ключами в датасторе",
-		Version: "1.0.0",
+		Version: AppVersion,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:    "path",
-				Aliases: []string{"p"},
-				Value:   "./.data",
-				Usage:   "Путь к директории датастора",
+				Name:    "data",
+				Aliases: []string{"d"},
+				Value:   DefaultDataDir,
+				Usage:   "Директория для хранения данных",
+				EnvVars: []string{"UES_DATA_DIR"},
 			},
 		},
 		Commands: []*cli.Command{
@@ -151,7 +158,7 @@ func main() {
 }
 
 func openDatastore(ctx *cli.Context) (datastore.Datastore, error) {
-	path := ctx.String("path")
+	path := ctx.String("data")
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, fmt.Errorf("не удалось создать директорию: %w", err)
 	}
