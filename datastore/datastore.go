@@ -2,6 +2,8 @@ package datastore
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
@@ -19,6 +21,16 @@ type Datastore interface {
 	Merge(ctx context.Context, other Datastore) error
 	Clear(ctx context.Context) error
 	Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <-chan error, error)
+	//
+	Subscribe(subscriber Subscriber)
+	Unsubscribe(subscriberID string)
+	SubscribeFunc(id string, handler EventHandler)
+	SubscribeChannel(id string, buffer int) *ChannelSubscriber
+	//
+	CreateJSSubscription(ctx context.Context, id, script string, config *JSSubscriberConfig) error
+	RemoveJSSubscription(ctx context.Context, id string) error
+	ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscription, error)
+	LoadJSSubscriptions(ctx context.Context) error
 }
 
 type KeyValue struct {
@@ -35,6 +47,11 @@ var _ ds.Batching = (*datastorage)(nil)
 
 type datastorage struct {
 	*badger4.Datastore
+	subscribers map[string]Subscriber
+	mu          sync.RWMutex
+	eventQueue  chan Event
+	done        chan struct{}
+	wg          sync.WaitGroup
 }
 
 func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
@@ -42,7 +59,104 @@ func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &datastorage{Datastore: badgerDS}, nil
+	ds := &datastorage{
+		Datastore:   badgerDS,
+		subscribers: make(map[string]Subscriber),
+		eventQueue:  make(chan Event, 1000), // Buffer for event queue
+		done:        make(chan struct{}),
+	}
+	// Start event dispatcher
+	ds.wg.Add(1)
+	go ds.eventDispatcher()
+
+	// Load saved JS subscriptions
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := ds.LoadJSSubscriptions(ctx); err != nil {
+		// Log error but don't fail initialization
+		// In production you might want proper logging here
+	}
+
+	return ds, nil
+}
+
+func (s *datastorage) eventDispatcher() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.done:
+			return
+		case event := <-s.eventQueue:
+			s.mu.RLock()
+			for _, subscriber := range s.subscribers {
+				// Run each subscriber in its own goroutine to prevent blocking
+				go func(sub Subscriber, evt Event) {
+					defer func() {
+						if r := recover(); r != nil {
+							// Log panic but don't crash the dispatcher
+							// In production, you might want to use proper logging
+						}
+					}()
+					sub.OnEvent(evt)
+				}(subscriber, event)
+			}
+			s.mu.RUnlock()
+		}
+	}
+}
+
+func (s *datastorage) publishEvent(eventType EventType, key ds.Key, value []byte) {
+	event := Event{
+		Type:      eventType,
+		Key:       key,
+		Value:     value,
+		Timestamp: time.Now(),
+	}
+
+	select {
+	case s.eventQueue <- event:
+	default:
+		// Drop event if queue is full to prevent blocking
+	}
+}
+
+func (s *datastorage) Subscribe(subscriber Subscriber) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.subscribers[subscriber.ID()] = subscriber
+}
+
+func (s *datastorage) Unsubscribe(subscriberID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.subscribers, subscriberID)
+}
+
+func (s *datastorage) SubscribeFunc(id string, handler EventHandler) {
+	s.Subscribe(NewFuncSubscriber(id, handler))
+}
+
+func (s *datastorage) SubscribeChannel(id string, buffer int) *ChannelSubscriber {
+	sub := NewChannelSubscriber(id, buffer)
+	s.Subscribe(sub)
+	return sub
+}
+
+func (s *datastorage) Put(ctx context.Context, key ds.Key, value []byte) error {
+	err := s.Datastore.Put(ctx, key, value)
+	if err == nil {
+		s.publishEvent(EventPut, key, value)
+	}
+	return err
+}
+
+func (s *datastorage) Delete(ctx context.Context, key ds.Key) error {
+	err := s.Datastore.Delete(ctx, key)
+	if err == nil {
+		s.publishEvent(EventDelete, key, nil)
+	}
+	return err
 }
 
 func (s *datastorage) Iterator(ctx context.Context, prefix ds.Key, keysOnly bool) (<-chan KeyValue, <-chan error, error) {
@@ -175,4 +289,89 @@ func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <
 		}
 	}()
 	return out, errc, nil
+}
+
+// Close method to clean up resources
+func (s *datastorage) Close() error {
+	close(s.done)
+	s.wg.Wait()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Close all channel subscribers
+	for _, subscriber := range s.subscribers {
+		if chSub, ok := subscriber.(*ChannelSubscriber); ok {
+			chSub.Close()
+		}
+		if jsSub, ok := subscriber.(*JSSubscriber); ok {
+			jsSub.Close()
+		}
+	}
+
+	return s.Datastore.Close()
+}
+
+type pubsubBatch struct {
+	ds.Batch
+	parent *datastorage
+	ops    []batchOp
+}
+
+type batchOp struct {
+	isDelete bool
+	key      ds.Key
+	value    []byte
+}
+
+func (s *datastorage) Batch(ctx context.Context) (ds.Batch, error) {
+	batch, err := s.Datastore.Batch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &pubsubBatch{
+		Batch:  batch,
+		parent: s,
+		ops:    make([]batchOp, 0),
+	}, nil
+}
+
+func (b *pubsubBatch) Put(ctx context.Context, key ds.Key, value []byte) error {
+	err := b.Batch.Put(ctx, key, value)
+	if err == nil {
+		b.ops = append(b.ops, batchOp{
+			isDelete: false,
+			key:      key,
+			value:    value,
+		})
+	}
+	return err
+}
+
+func (b *pubsubBatch) Delete(ctx context.Context, key ds.Key) error {
+	err := b.Batch.Delete(ctx, key)
+	if err == nil {
+		b.ops = append(b.ops, batchOp{
+			isDelete: true,
+			key:      key,
+		})
+	}
+	return err
+}
+
+func (b *pubsubBatch) Commit(ctx context.Context) error {
+	err := b.Batch.Commit(ctx)
+	if err == nil {
+		// Publish batch event with all operations
+		for _, op := range b.ops {
+			if op.isDelete {
+				b.parent.publishEvent(EventDelete, op.key, nil)
+			} else {
+				b.parent.publishEvent(EventPut, op.key, op.value)
+			}
+		}
+		// Also publish a batch event
+		b.parent.publishEvent(EventBatch, ds.NewKey("/batch"), nil)
+	}
+	return err
 }
