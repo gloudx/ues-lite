@@ -56,6 +56,11 @@ func (app *App) Close() error {
 	return nil
 }
 
+func initApp(c *cli.Context) (*App, error) {
+	dataDir := c.String("data")
+	return NewApp(dataDir)
+}
+
 func main() {
 	multicodec.RegisterEncoder(0x71, dagcbor.Encode)
 	multicodec.RegisterDecoder(0x71, dagcbor.Decode)
@@ -1008,11 +1013,6 @@ func prefetchAction(c *cli.Context) error {
 }
 
 // Вспомогательные функции
-
-func initApp(c *cli.Context) (*App, error) {
-	dataDir := c.String("data")
-	return NewApp(dataDir)
-}
 
 func formatBytes(bytes int) string {
 	const unit = 1024
