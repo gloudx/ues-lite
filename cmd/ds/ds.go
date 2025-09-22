@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -29,6 +30,11 @@ func newApp(dataDir string) (*app, error) {
 	if err != nil {
 		return nil, fmt.Errorf("инициализация datastore: %w", err)
 	}
+
+	ds.CreateSimpleJSSubscription(context.Background(), "log_all", `
+		console.log("zzzzzzzzzzzzzzzzzzzzzzzzz")
+	`)
+
 	return &app{ds: ds}, nil
 }
 

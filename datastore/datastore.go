@@ -2,6 +2,8 @@ package datastore
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -31,6 +33,11 @@ type Datastore interface {
 	RemoveJSSubscription(ctx context.Context, id string) error
 	ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscription, error)
 	LoadJSSubscriptions(ctx context.Context) error
+	//
+	CreateSimpleJSSubscription(ctx context.Context, id, script string) error
+	CreateFilteredJSSubscription(ctx context.Context, id, script string, eventTypes ...EventType) error
+	//
+	Close() error
 }
 
 type KeyValue struct {
@@ -74,8 +81,7 @@ func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 	defer cancel()
 
 	if err := ds.LoadJSSubscriptions(ctx); err != nil {
-		// Log error but don't fail initialization
-		// In production you might want proper logging here
+		log.Printf("ошибка загрузки JS подписок: %v", err)
 	}
 
 	return ds, nil
@@ -89,19 +95,27 @@ func (s *datastorage) eventDispatcher() {
 			return
 		case event := <-s.eventQueue:
 			s.mu.RLock()
-			for _, subscriber := range s.subscribers {
+			// Create a snapshot of subscribers to avoid race conditions
+			subscribers := make(map[string]Subscriber)
+			for id, subscriber := range s.subscribers {
+				subscribers[id] = subscriber
+			}
+			s.mu.RUnlock()
+
+			for id, subscriber := range subscribers {
 				// Run each subscriber in its own goroutine to prevent blocking
-				go func(sub Subscriber, evt Event) {
+				s.wg.Add(1)
+				go func(subID string, sub Subscriber, evt Event) {
+					defer s.wg.Done()
 					defer func() {
 						if r := recover(); r != nil {
 							// Log panic but don't crash the dispatcher
-							// In production, you might want to use proper logging
+							fmt.Printf("panic in subscriber %s: %v\n", subID, r)
 						}
 					}()
 					sub.OnEvent(evt)
-				}(subscriber, event)
+				}(id, subscriber, event)
 			}
-			s.mu.RUnlock()
 		}
 	}
 }
@@ -374,4 +388,21 @@ func (b *pubsubBatch) Commit(ctx context.Context) error {
 		b.parent.publishEvent(EventBatch, ds.NewKey("/batch"), nil)
 	}
 	return err
+}
+
+// CreateSimpleJSSubscription creates a JS subscription with default settings
+func (s *datastorage) CreateSimpleJSSubscription(ctx context.Context, id, script string) error {
+	return s.CreateJSSubscription(ctx, id, script, nil)
+}
+
+// CreateFilteredJSSubscription creates a JS subscription for specific event types
+func (s *datastorage) CreateFilteredJSSubscription(ctx context.Context, id, script string, eventTypes ...EventType) error {
+	config := &JSSubscriberConfig{
+		ExecutionTimeout: 5 * time.Second,
+		EnableNetworking: true,
+		EnableLogging:    true,
+		StrictMode:       false,
+		EventFilters:     eventTypes,
+	}
+	return s.CreateJSSubscription(ctx, id, script, config)
 }

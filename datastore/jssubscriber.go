@@ -115,6 +115,7 @@ func (js *JSSubscriber) initVM() error {
 	}
 
 	js.vm = vm
+
 	return nil
 }
 
@@ -314,6 +315,14 @@ func (js *JSSubscriber) ID() string {
 }
 
 func (js *JSSubscriber) OnEvent(event Event) {
+	// Check if subscriber is closed
+	js.mu.RLock()
+	if js.vm == nil {
+		js.mu.RUnlock()
+		return
+	}
+	js.mu.RUnlock()
+
 	// Check event filters
 	if len(js.config.EventFilters) > 0 {
 		found := false
@@ -355,10 +364,18 @@ func (js *JSSubscriber) OnEvent(event Event) {
 		}
 	}
 }
-
 func (js *JSSubscriber) executeScript(event Event) {
+
 	js.mu.RLock()
 	defer js.mu.RUnlock()
+
+	// Double check VM is available
+	if js.vm == nil {
+		if js.config.EnableLogging {
+			js.logger.Printf("VM is nil, skipping event for subscriber %s", js.id)
+		}
+		return
+	}
 
 	// Prepare event data for JavaScript
 	eventType := "unknown"
@@ -397,23 +414,25 @@ func (js *JSSubscriber) executeScript(event Event) {
 	js.vm.Set("event", jsEvent)
 
 	// Execute main handler function if it exists
-	handlerFunc := js.vm.Get("onEvent")
-	if handlerFunc != nil && !goja.IsUndefined(handlerFunc) && !goja.IsNull(handlerFunc) {
-		if callable, ok := goja.AssertFunction(handlerFunc); ok {
-			_, err := callable(goja.Undefined(), js.vm.ToValue(jsEvent))
-			if err != nil && js.config.EnableLogging {
-				js.logger.Printf("Handler function error: %v", err)
-			}
-		}
-	} else {
-		// Execute the entire script if no handler function
-		if js.script != "" {
-			_, err := js.vm.RunString(js.script)
-			if err != nil && js.config.EnableLogging {
-				js.logger.Printf("Script execution error: %v", err)
-			}
+	// handlerFunc := js.vm.Get("onEvent")
+
+	// if handlerFunc != nil && !goja.IsUndefined(handlerFunc) && !goja.IsNull(handlerFunc) {
+	// 	if callable, ok := goja.AssertFunction(handlerFunc); ok {
+	// 		_, err := callable(goja.Undefined(), js.vm.ToValue(jsEvent))
+	// 		if err != nil && js.config.EnableLogging {
+	// 			js.logger.Printf("Handler function error: %v", err)
+	// 		}
+	// 	}
+	// } else {
+	// Execute the entire script if no handler function
+
+	if js.script != "" {
+		_, err := js.vm.RunString(js.script)
+		if err != nil && js.config.EnableLogging {
+			js.logger.Printf("Script execution error: %v", err)
 		}
 	}
+	// }
 }
 
 // UpdateScript safely updates the JavaScript code
@@ -422,8 +441,13 @@ func (js *JSSubscriber) UpdateScript(newScript string) error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
+	// Don't update if VM is closed
+	if js.vm == nil {
+		return fmt.Errorf("subscriber is closed")
+	}
+
 	// Test compilation
-	_, err := goja.Compile("user-script-test", newScript, js.config.StrictMode)
+	_, err := goja.Compile("user-script", newScript, js.config.StrictMode)
 	if err != nil {
 		return fmt.Errorf("script compilation failed: %w", err)
 	}
@@ -441,6 +465,7 @@ func (js *JSSubscriber) GetScript() string {
 
 // Close cleans up resources
 func (js *JSSubscriber) Close() error {
+
 	js.mu.Lock()
 	defer js.mu.Unlock()
 

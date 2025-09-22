@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	ds "github.com/ipfs/go-datastore"
@@ -98,12 +99,6 @@ func (s *datastorage) RemoveJSSubscription(ctx context.Context, id string) error
 		return fmt.Errorf("subscription ID cannot be empty")
 	}
 
-	// Remove from datastore
-	key := ds.NewKey(SubscriptionsNamespace).ChildString(id)
-	if err := s.Datastore.Delete(ctx, key); err != nil {
-		return fmt.Errorf("failed to delete subscription: %w", err)
-	}
-
 	// Remove from memory
 	s.mu.Lock()
 	if existing, exists := s.subscribers[id]; exists {
@@ -113,6 +108,12 @@ func (s *datastorage) RemoveJSSubscription(ctx context.Context, id string) error
 		delete(s.subscribers, id)
 	}
 	s.mu.Unlock()
+
+	// Remove from datastore
+	key := ds.NewKey(SubscriptionsNamespace).ChildString(id)
+	if err := s.Datastore.Delete(ctx, key); err != nil {
+		return fmt.Errorf("failed to delete subscription: %w", err)
+	}
 
 	return nil
 }
@@ -180,6 +181,7 @@ func (s *datastorage) LoadJSSubscriptions(ctx context.Context) error {
 		jsSubscriber, err := NewJSSubscriber(config)
 		if err != nil {
 			// Skip invalid subscriptions but continue loading others
+			log.Printf("failed to recreate subscription %s: %v", savedSub.ID, err)
 			continue
 		}
 
@@ -194,25 +196,9 @@ func (s *datastorage) LoadJSSubscriptions(ctx context.Context) error {
 		}
 
 		s.subscribers[savedSub.ID] = jsSubscriber
+
 		loadedCount++
 	}
 
 	return nil
-}
-
-// CreateSimpleJSSubscription creates a JS subscription with default settings
-func (s *datastorage) CreateSimpleJSSubscription(ctx context.Context, id, script string) error {
-	return s.CreateJSSubscription(ctx, id, script, nil)
-}
-
-// CreateFilteredJSSubscription creates a JS subscription for specific event types
-func (s *datastorage) CreateFilteredJSSubscription(ctx context.Context, id, script string, eventTypes ...EventType) error {
-	config := &JSSubscriberConfig{
-		ExecutionTimeout: 5 * time.Second,
-		EnableNetworking: true,
-		EnableLogging:    true,
-		StrictMode:       false,
-		EventFilters:     eventTypes,
-	}
-	return s.CreateJSSubscription(ctx, id, script, config)
 }

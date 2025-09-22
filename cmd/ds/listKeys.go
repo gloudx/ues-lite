@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	ds "github.com/ipfs/go-datastore"
@@ -60,9 +61,14 @@ func listKeys(ctx *cli.Context) error {
 			if keysOnly {
 				t.AppendRow(table.Row{count, kv.Key.String()})
 			} else {
-				value := string(kv.Value)
-				if len(value) > 100 {
-					value = value[:97] + "..."
+				var value string
+				if strings.HasPrefix(kv.Key.String(), "/_system/") {
+					value = "<system data>"
+				} else {
+					value = string(kv.Value)
+					if len(value) > 100 {
+						value = value[:97] + "..."
+					}
 				}
 				t.AppendRow(table.Row{count, kv.Key.String(), value, fmt.Sprintf("%d байт", len(kv.Value))})
 			}
