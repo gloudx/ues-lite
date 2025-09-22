@@ -17,6 +17,8 @@ import (
 	"ues-lite/tid"
 
 	ds "github.com/ipfs/go-datastore"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"github.com/urfave/cli/v2"
 )
 
@@ -36,6 +38,8 @@ func loadJSONL(ctx *cli.Context) error {
 	idType := ctx.String("id-type")
 	batchSize := ctx.Int("batch-size")
 	clockID := ctx.Uint("clock-id")
+	patch := ctx.StringSlice("patch")
+	extract := ctx.String("extract")
 
 	// Создаем TID clock если нужен TID
 	var tidClock tid.TIDClock
@@ -47,7 +51,7 @@ func loadJSONL(ctx *cli.Context) error {
 	defer cancel()
 
 	fmt.Printf("📥 Загрузка JSON Lines из: %s\n", sourcePath)
-	fmt.Printf("🏷️  Префикс ключей: %s\n", prefix)
+	fmt.Printf("🏷️ Префикс ключей: %s\n", prefix)
 	fmt.Printf("🆔 Тип ID: %s\n", idType)
 
 	// Определяем тип источника
@@ -63,7 +67,7 @@ func loadJSONL(ctx *cli.Context) error {
 	for filename, reader := range readers {
 		fmt.Printf("\n📄 Обработка файла: %s\n", filename)
 
-		processed, errors, err := processJSONLFile(ctxTimeout, app, reader, prefix, idType, &tidClock, batchSize)
+		processed, errors, err := processJSONLFile(ctxTimeout, app, reader, prefix, idType, extract, patch, &tidClock, batchSize)
 		if err != nil {
 			fmt.Printf("❌ Ошибка при обработке файла %s: %v\n", filename, err)
 			continue
@@ -262,7 +266,7 @@ func getReadersFromTar(file *os.File, isGzip bool) (map[string]io.Reader, error)
 	return readers, nil
 }
 
-func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, idType string, tidClock *tid.TIDClock, batchSize int) (int, int, error) {
+func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, idType, extract string, patch []string, tidClock *tid.TIDClock, batchSize int) (int, int, error) {
 	scanner := bufio.NewScanner(reader)
 
 	// Увеличиваем буфер для больших строк
@@ -279,6 +283,7 @@ func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, i
 	batchCount := 0
 
 	for scanner.Scan() {
+
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -308,6 +313,46 @@ func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, i
 			key = ds.NewKey(keyID)
 		} else {
 			key = ds.NewKey(prefix).ChildString(keyID)
+		}
+
+		if extract != "" {
+			line = gjson.Get(line, extract).String()
+		}
+
+		if len(patch) > 0 {
+			for _, p := range patch {
+				var err error
+				k, v, ok := strings.Cut(p, "=")
+				if ok {
+					var value any = v
+					var t string
+					t, v, ok = strings.Cut(v, "#")
+					if ok {
+						switch t {
+						case "int":
+							value = parseInt(v)
+						case "float":
+							value = parseFloat(v)
+						case "bool":
+							value = parseBool(v)
+						case "json":
+							var jsonVal any
+							if err := json.Unmarshal([]byte(v), &jsonVal); err != nil {
+								fmt.Printf("⚠️  Ошибка разбора JSON в патче '%s' для ключа %s: %v\n", p, key.String(), err)
+								continue
+							}
+							value = jsonVal
+						default:
+							value = v // по умолчанию строка
+						}
+					}
+					line, err = sjson.Set(line, k, value)
+					if err != nil {
+						fmt.Printf("⚠️  Ошибка применения патча '%s' к ключу %s: %v\n", p, key.String(), err)
+						continue
+					}
+				}
+			}
 		}
 
 		// Добавляем в batch
@@ -373,6 +418,14 @@ func init() {
 				Aliases: []string{"p"},
 				Value:   "/jsonl",
 				Usage:   "Префикс для ключей",
+			},
+			&cli.StringSliceFlag{
+				Name:  "patch",
+				Usage: "",
+			},
+			&cli.StringFlag{
+				Name:  "extract",
+				Usage: "",
 			},
 			&cli.StringFlag{
 				Name:    "id-type",

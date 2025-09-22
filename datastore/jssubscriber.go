@@ -366,8 +366,8 @@ func (js *JSSubscriber) OnEvent(event Event) {
 }
 func (js *JSSubscriber) executeScript(event Event) {
 
-	js.mu.RLock()
-	defer js.mu.RUnlock()
+	js.mu.Lock()
+	defer js.mu.Unlock()
 
 	// Double check VM is available
 	if js.vm == nil {
