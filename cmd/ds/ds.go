@@ -18,7 +18,8 @@ const (
 )
 
 type app struct {
-	ds datastore.Datastore
+	ds       datastore.Datastore
+	isRemote bool
 }
 
 func newApp(dataDir string) (*app, error) {
@@ -40,7 +41,26 @@ func (app *app) Close() error {
 	return nil
 }
 
+func newRemoteApp(endpoint string) (*app, error) {
+	ds, err := NewRemoteDatastore(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("подключение к удаленному датастору: %w", err)
+	}
+
+	// Создаем адаптер для RemoteDatastore
+	adapter := &RemoteDatastoreAdapter{ds}
+
+	return &app{ds: adapter, isRemote: true}, nil
+}
+
 func initApp(c *cli.Context) (*app, error) {
+	// Проверяем, указан ли эндпоинт для удаленного подключения
+	if endpoint := c.String("endpoint"); endpoint != "" {
+		fmt.Printf("🌐 Подключение к удаленному серверу: %s\n", endpoint)
+		return newRemoteApp(endpoint)
+	}
+
+	// Локальный режим
 	return newApp(c.String("data"))
 }
 
@@ -59,8 +79,43 @@ func main() {
 				Usage:   "Директория для хранения данных",
 				EnvVars: []string{"UES_DATA_DIR"},
 			},
+			&cli.StringFlag{
+				Name:    "endpoint",
+				Aliases: []string{"e"},
+				Usage:   "Эндпоинт удаленного API сервера (http://host:port или unix:///path/to/socket)",
+				EnvVars: []string{"UES_ENDPOINT"},
+			},
 		},
 		Commands: commands,
+		Before: func(c *cli.Context) error {
+			// Валидация: нельзя использовать --data и --endpoint одновременно
+			if c.String("data") != DefaultDataDir && c.String("endpoint") != "" {
+				return fmt.Errorf("нельзя одновременно использовать --data и --endpoint")
+			}
+			return nil
+		},
+		Description: `UES Datastore - утилита для работы с ключ-значение хранилищем.
+
+Поддерживает два режима работы:
+
+1. ЛОКАЛЬНЫЙ РЕЖИМ (по умолчанию):
+   ues-ds --data ./mydata list
+   ues-ds put /test "Hello World"
+
+2. УДАЛЕННЫЙ РЕЖИМ (через API):
+   ues-ds --endpoint http://localhost:8080 list
+   ues-ds --endpoint unix:///tmp/ues-ds.sock put /test "Hello World"
+
+Переменные окружения:
+   UES_DATA_DIR    - директория для локальных данных
+   UES_ENDPOINT    - эндпоинт удаленного сервера
+
+Примеры удаленных эндпоинтов:
+   http://localhost:8080        # HTTP сервер
+   https://myserver.com:8080    # HTTPS сервер  
+   unix:///tmp/ues-ds.sock     # Unix socket
+
+Для запуска собственного сервера используйте команду 'serve'.`,
 	}
 
 	if err := app.Run(os.Args); err != nil {
