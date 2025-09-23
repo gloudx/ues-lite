@@ -17,6 +17,7 @@ import (
 	"ues-lite/tid"
 
 	ds "github.com/ipfs/go-datastore"
+	"github.com/itchyny/gojq"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"github.com/urfave/cli/v2"
@@ -40,6 +41,23 @@ func loadJSONL(ctx *cli.Context) error {
 	clockID := ctx.Uint("clock-id")
 	patch := ctx.StringSlice("patch")
 	extract := ctx.String("extract")
+	jqExpr := ctx.String("jq")
+	silent := ctx.Bool("silent")
+	if silent {
+		app.ds.SetSilentMode(true)
+		defer app.ds.SetSilentMode(false)
+	}
+
+	// Компилируем jq выражение если указано
+	var jqQuery *gojq.Query
+	if jqExpr != "" {
+		query, err := gojq.Parse(jqExpr)
+		if err != nil {
+			return fmt.Errorf("ошибка парсинга jq выражения '%s': %w", jqExpr, err)
+		}
+		jqQuery = query
+		fmt.Printf("🔍 jq выражение: %s\n", jqExpr)
+	}
 
 	// Создаем TID clock если нужен TID
 	var tidClock tid.TIDClock
@@ -67,7 +85,7 @@ func loadJSONL(ctx *cli.Context) error {
 	for filename, reader := range readers {
 		fmt.Printf("\n📄 Обработка файла: %s\n", filename)
 
-		processed, errors, err := processJSONLFile(ctxTimeout, app, reader, prefix, idType, extract, patch, &tidClock, batchSize)
+		processed, errors, err := processJSONLFile(ctxTimeout, app, reader, prefix, idType, extract, patch, jqQuery, &tidClock, batchSize)
 		if err != nil {
 			fmt.Printf("❌ Ошибка при обработке файла %s: %v\n", filename, err)
 			continue
@@ -266,7 +284,7 @@ func getReadersFromTar(file *os.File, isGzip bool) (map[string]io.Reader, error)
 	return readers, nil
 }
 
-func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, idType, extract string, patch []string, tidClock *tid.TIDClock, batchSize int) (int, int, error) {
+func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, idType, extract string, patch []string, jqQuery *gojq.Query, tidClock *tid.TIDClock, batchSize int) (int, int, error) {
 	scanner := bufio.NewScanner(reader)
 
 	// Увеличиваем буфер для больших строк
@@ -355,6 +373,19 @@ func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, i
 			}
 		}
 
+		// Применяем jq выражение
+		if jqQuery != nil {
+			transformedBytes, err := applyJQExpression(jqQuery, []byte(line), key.String())
+			if err != nil {
+				fmt.Printf("⚠️  Ошибка применения jq к ключу %s: %v\n", key.String(), err)
+				continue
+			}
+			if string(transformedBytes) == "null" {
+				continue
+			}
+			line = string(transformedBytes)
+		}
+
 		// Добавляем в batch
 		err := batch.Put(ctx, key, []byte(line))
 		if err != nil {
@@ -409,8 +440,8 @@ func processJSONLFile(ctx context.Context, app *app, reader io.Reader, prefix, i
 
 func init() {
 	commands = append(commands, &cli.Command{
-		Name:    "load-jsonl",
-		Aliases: []string{"import", "load"},
+		Name:    "import",
+		Aliases: []string{"load"},
 		Usage:   "Загрузить JSON Lines файлы в датастор",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -421,11 +452,15 @@ func init() {
 			},
 			&cli.StringSliceFlag{
 				Name:  "patch",
-				Usage: "",
+				Usage: "Патчи для JSON в формате 'path=value' или 'path=type#value' (type: int, float, bool, json)",
 			},
 			&cli.StringFlag{
 				Name:  "extract",
-				Usage: "",
+				Usage: "JSONPath для извлечения части значения",
+			},
+			&cli.StringFlag{
+				Name:  "jq",
+				Usage: "jq выражение для фильтрации/трансформации данных",
 			},
 			&cli.StringFlag{
 				Name:    "id-type",
@@ -444,6 +479,10 @@ func init() {
 				Aliases: []string{"b"},
 				Value:   1000,
 				Usage:   "Размер batch для записи в датастор",
+			},
+			&cli.BoolFlag{
+				Name:  "silent",
+				Usage: "Отключить публикацию событий для этой операции (только для этой команды)",
 			},
 		},
 		Action:    loadJSONL,

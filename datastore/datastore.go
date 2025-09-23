@@ -29,15 +29,18 @@ type Datastore interface {
 	SubscribeFunc(id string, handler EventHandler)
 	SubscribeChannel(id string, buffer int) *ChannelSubscriber
 	//
+	ListJSSubscriptions(ctx context.Context) ([]jsSubscription, error)
 	CreateJSSubscription(ctx context.Context, id, script string, config *JSSubscriberConfig) error
-	RemoveJSSubscription(ctx context.Context, id string) error
-	ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscription, error)
-	LoadJSSubscriptions(ctx context.Context) error
-	//
 	CreateSimpleJSSubscription(ctx context.Context, id, script string) error
 	CreateFilteredJSSubscription(ctx context.Context, id, script string, eventTypes ...EventType) error
+	RemoveJSSubscription(ctx context.Context, id string) error
 	//
 	Close() error
+	SetSilentMode(silent bool)
+	//
+	QueryJQ(ctx context.Context, jqQuery string, opts *JQQueryOptions) (<-chan JQResult, <-chan error, error)
+	AggregateJQ(ctx context.Context, jqQuery string, opts *JQQueryOptions) (any, error)
+	QueryJQSingle(ctx context.Context, key ds.Key, jqQuery string) (interface{}, error)
 }
 
 type KeyValue struct {
@@ -52,6 +55,7 @@ var _ ds.TTLDatastore = (*datastorage)(nil)
 var _ ds.GCDatastore = (*datastorage)(nil)
 var _ ds.Batching = (*datastorage)(nil)
 
+// Обновленная структура datastorage с поддержкой jq
 type datastorage struct {
 	*badger4.Datastore
 	subscribers map[string]Subscriber
@@ -59,30 +63,35 @@ type datastorage struct {
 	eventQueue  chan Event
 	done        chan struct{}
 	wg          sync.WaitGroup
+	silentMode  bool
+	jqCache     *jqQueryCache
 }
 
+// Обновляем конструктор
 func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
+
 	badgerDS, err := badger4.NewDatastore(path, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	ds := &datastorage{
 		Datastore:   badgerDS,
 		subscribers: make(map[string]Subscriber),
 		eventQueue:  make(chan Event, 1000), // Buffer for event queue
 		done:        make(chan struct{}),
+		jqCache:     newJQQueryCache(), // Инициализируем кэш
 	}
-	// Start event dispatcher
-	ds.wg.Add(1)
-	go ds.eventDispatcher()
 
-	// Load saved JS subscriptions
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := ds.LoadJSSubscriptions(ctx); err != nil {
+	if err := ds.loadJSSubscriptions(ctx); err != nil {
 		log.Printf("ошибка загрузки JS подписок: %v", err)
 	}
+
+	ds.wg.Add(1)
+	go ds.eventDispatcher()
 
 	return ds, nil
 }
@@ -95,25 +104,21 @@ func (s *datastorage) eventDispatcher() {
 			return
 		case event := <-s.eventQueue:
 			s.mu.RLock()
-			// Create a snapshot of subscribers to avoid race conditions
 			subscribers := make(map[string]Subscriber)
 			for id, subscriber := range s.subscribers {
 				subscribers[id] = subscriber
 			}
 			s.mu.RUnlock()
-
 			for id, subscriber := range subscribers {
-				// Run each subscriber in its own goroutine to prevent blocking
 				s.wg.Add(1)
 				go func(subID string, sub Subscriber, evt Event) {
 					defer s.wg.Done()
 					defer func() {
 						if r := recover(); r != nil {
-							// Log panic but don't crash the dispatcher
 							fmt.Printf("panic in subscriber %s: %v\n", subID, r)
 						}
 					}()
-					sub.OnEvent(evt)
+					sub.OnEvent(context.Background(), evt)
 				}(id, subscriber, event)
 			}
 		}
@@ -133,6 +138,12 @@ func (s *datastorage) publishEvent(eventType EventType, key ds.Key, value []byte
 	default:
 		// Drop event if queue is full to prevent blocking
 	}
+}
+
+func (s *datastorage) SetSilentMode(silent bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.silentMode = silent
 }
 
 func (s *datastorage) Subscribe(subscriber Subscriber) {
@@ -160,7 +171,9 @@ func (s *datastorage) SubscribeChannel(id string, buffer int) *ChannelSubscriber
 func (s *datastorage) Put(ctx context.Context, key ds.Key, value []byte) error {
 	err := s.Datastore.Put(ctx, key, value)
 	if err == nil {
-		s.publishEvent(EventPut, key, value)
+		if !s.silentMode {
+			s.publishEvent(EventPut, key, value)
+		}
 	}
 	return err
 }
@@ -168,7 +181,9 @@ func (s *datastorage) Put(ctx context.Context, key ds.Key, value []byte) error {
 func (s *datastorage) Delete(ctx context.Context, key ds.Key) error {
 	err := s.Datastore.Delete(ctx, key)
 	if err == nil {
-		s.publishEvent(EventDelete, key, nil)
+		if !s.silentMode {
+			s.publishEvent(EventDelete, key, nil)
+		}
 	}
 	return err
 }
@@ -307,19 +322,38 @@ func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <
 
 // Close method to clean up resources
 func (s *datastorage) Close() error {
+
 	close(s.done)
 	s.wg.Wait()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// for event := range s.eventQueue {
+	// 	s.mu.RLock()
+	// 	subscribers := make(map[string]Subscriber)
+	// 	for id, subscriber := range s.subscribers {
+	// 		subscribers[id] = subscriber
+	// 	}
+	// 	s.mu.RUnlock()
+	// 	for id, subscriber := range subscribers {
+	// 		s.wg.Add(1)
+	// 		go func(subID string, sub Subscriber, evt Event) {
+	// 			defer s.wg.Done()
+	// 			defer func() {
+	// 				if r := recover(); r != nil {
+	// 					fmt.Printf("panic in subscriber %s: %v\n", subID, r)
+	// 				}
+	// 			}()
+	// 			sub.OnEvent(context.Background(), evt)
+	// 		}(id, subscriber, event)
+	// 	}
+	// }
+
 	// Close all channel subscribers
 	for _, subscriber := range s.subscribers {
 		if chSub, ok := subscriber.(*ChannelSubscriber); ok {
 			chSub.Close()
-		}
-		if jsSub, ok := subscriber.(*JSSubscriber); ok {
-			jsSub.Close()
 		}
 	}
 
@@ -328,8 +362,9 @@ func (s *datastorage) Close() error {
 
 type pubsubBatch struct {
 	ds.Batch
-	parent *datastorage
-	ops    []batchOp
+	parent     *datastorage
+	ops        []batchOp
+	silentMode bool
 }
 
 type batchOp struct {
@@ -344,9 +379,10 @@ func (s *datastorage) Batch(ctx context.Context) (ds.Batch, error) {
 		return nil, err
 	}
 	return &pubsubBatch{
-		Batch:  batch,
-		parent: s,
-		ops:    make([]batchOp, 0),
+		Batch:      batch,
+		parent:     s,
+		ops:        make([]batchOp, 0),
+		silentMode: s.silentMode,
 	}, nil
 }
 
@@ -376,16 +412,16 @@ func (b *pubsubBatch) Delete(ctx context.Context, key ds.Key) error {
 func (b *pubsubBatch) Commit(ctx context.Context) error {
 	err := b.Batch.Commit(ctx)
 	if err == nil {
-		// Publish batch event with all operations
-		for _, op := range b.ops {
-			if op.isDelete {
-				b.parent.publishEvent(EventDelete, op.key, nil)
-			} else {
-				b.parent.publishEvent(EventPut, op.key, op.value)
+		if !b.silentMode {
+			for _, op := range b.ops {
+				if op.isDelete {
+					b.parent.publishEvent(EventDelete, op.key, nil)
+				} else {
+					b.parent.publishEvent(EventPut, op.key, op.value)
+				}
 			}
+			b.parent.publishEvent(EventBatch, ds.NewKey("/batch"), nil)
 		}
-		// Also publish a batch event
-		b.parent.publishEvent(EventBatch, ds.NewKey("/batch"), nil)
 	}
 	return err
 }

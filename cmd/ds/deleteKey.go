@@ -22,6 +22,11 @@ func deleteKey(ctx *cli.Context) error {
 	defer app.Close()
 
 	key := ctx.Args().Get(0)
+	silent := ctx.Bool("silent")
+	if silent {
+		app.ds.SetSilentMode(true)
+		defer app.ds.SetSilentMode(false)
+	}
 
 	dsKey := ds.NewKey(key)
 
@@ -40,9 +45,15 @@ func deleteKey(ctx *cli.Context) error {
 
 func init() {
 	commands = append(commands, &cli.Command{
-		Name:      "delete",
-		Aliases:   []string{"d", "del"},
-		Usage:     "Удалить ключ",
+		Name:    "delete",
+		Aliases: []string{"d", "del"},
+		Usage:   "Удалить ключ",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "silent",
+				Usage: "Отключить публикацию событий для этой операции (только для этой команды)",
+			},
+		},
 		Action:    deleteKey,
 		ArgsUsage: "<ключ>",
 	})

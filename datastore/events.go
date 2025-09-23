@@ -1,12 +1,12 @@
 package datastore
 
 import (
+	"context"
 	"time"
 
 	ds "github.com/ipfs/go-datastore"
 )
 
-// EventType represents the type of datastore event
 type EventType int
 
 const (
@@ -15,7 +15,6 @@ const (
 	EventBatch
 )
 
-// Event represents a datastore event
 type Event struct {
 	Type      EventType
 	Key       ds.Key
@@ -23,20 +22,20 @@ type Event struct {
 	Timestamp time.Time
 }
 
-// Subscriber represents an event subscriber
 type Subscriber interface {
-	OnEvent(event Event)
+	OnEvent(ctx context.Context, event Event)
 	ID() string
 }
 
-// EventHandler is a function type for handling events
 type EventHandler func(Event)
 
-// FuncSubscriber implements Subscriber with a function
 type FuncSubscriber struct {
 	id      string
 	handler EventHandler
 }
+
+var _ Subscriber = (*FuncSubscriber)(nil)
+var _ Subscriber = (*ChannelSubscriber)(nil)
 
 func NewFuncSubscriber(id string, handler EventHandler) *FuncSubscriber {
 	return &FuncSubscriber{
@@ -45,7 +44,7 @@ func NewFuncSubscriber(id string, handler EventHandler) *FuncSubscriber {
 	}
 }
 
-func (fs *FuncSubscriber) OnEvent(event Event) {
+func (fs *FuncSubscriber) OnEvent(ctx context.Context, event Event) {
 	fs.handler(event)
 }
 
@@ -53,7 +52,6 @@ func (fs *FuncSubscriber) ID() string {
 	return fs.id
 }
 
-// ChannelSubscriber implements Subscriber with a channel
 type ChannelSubscriber struct {
 	id     string
 	events chan Event
@@ -68,7 +66,7 @@ func NewChannelSubscriber(id string, buffer int) *ChannelSubscriber {
 	}
 }
 
-func (cs *ChannelSubscriber) OnEvent(event Event) {
+func (cs *ChannelSubscriber) OnEvent(ctx context.Context, event Event) {
 	select {
 	case cs.events <- event:
 	default:

@@ -41,24 +41,24 @@ func (app *app) Close() error {
 	return nil
 }
 
-func newRemoteApp(endpoint string) (*app, error) {
-	ds, err := NewRemoteDatastore(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("подключение к удаленному датастору: %w", err)
-	}
+// func newRemoteApp(endpoint string) (*app, error) {
+// 	ds, err := NewRemoteDatastore(endpoint)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("подключение к удаленному датастору: %w", err)
+// 	}
 
-	// Создаем адаптер для RemoteDatastore
-	adapter := &RemoteDatastoreAdapter{ds}
+// 	// Создаем адаптер для RemoteDatastore
+// 	adapter := &RemoteDatastoreAdapter{ds}
 
-	return &app{ds: adapter, isRemote: true}, nil
-}
+// 	return &app{ds: adapter, isRemote: true}, nil
+// }
 
 func initApp(c *cli.Context) (*app, error) {
 	// Проверяем, указан ли эндпоинт для удаленного подключения
-	if endpoint := c.String("endpoint"); endpoint != "" {
-		fmt.Printf("🌐 Подключение к удаленному серверу: %s\n", endpoint)
-		return newRemoteApp(endpoint)
-	}
+	// if endpoint := c.String("endpoint"); endpoint != "" {
+	// 	fmt.Printf("🌐 Подключение к удаленному серверу: %s\n", endpoint)
+	// 	return newRemoteApp(endpoint)
+	// }
 
 	// Локальный режим
 	return newApp(c.String("data"))

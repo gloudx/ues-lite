@@ -24,12 +24,17 @@ func putKey(ctx *cli.Context) error {
 
 	key := ctx.Args().Get(0)
 	value := ctx.Args().Get(1)
+	silent := ctx.Bool("silent")
+	if silent {
+		app.ds.SetSilentMode(true)
+		defer app.ds.SetSilentMode(false)
+	}
 
 	dsKey := ds.NewKey(key)
 
 	var data []byte
 	if ctx.Bool("json") {
-		var jsonData interface{}
+		var jsonData any
 		if err := json.Unmarshal([]byte(value), &jsonData); err != nil {
 			return fmt.Errorf("неверный JSON: %w", err)
 		}
@@ -68,6 +73,10 @@ func init() {
 				Name:    "json",
 				Aliases: []string{"j"},
 				Usage:   "Сохранить значение как JSON",
+			},
+			&cli.BoolFlag{
+				Name:  "silent",
+				Usage: "Отключить публикацию событий для этой операции (только для этой команды)",
 			},
 		},
 		Action:    putKey,

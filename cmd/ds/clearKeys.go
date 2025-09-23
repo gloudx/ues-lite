@@ -29,6 +29,12 @@ func clearKeys(ctx *cli.Context) error {
 	}
 	defer app.Close()
 
+	silent := ctx.Bool("silent")
+	if silent {
+		app.ds.SetSilentMode(true)
+		defer app.ds.SetSilentMode(false)
+	}
+
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -51,6 +57,10 @@ func init() {
 				Name:    "force",
 				Aliases: []string{"f"},
 				Usage:   "Принудительная очистка без подтверждения",
+			},
+			&cli.BoolFlag{
+				Name:  "silent",
+				Usage: "Отключить публикацию событий для этой операции (только для этой команды)",
 			},
 		},
 		Action: clearKeys,

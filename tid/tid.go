@@ -145,6 +145,7 @@ func (c *TIDClock) Next() TID {
 		now = c.lastUnixMicro + 1
 	}
 	c.lastUnixMicro = now
+	c.ClockID++
 	c.mtx.Unlock()
 	return NewTID(now, c.ClockID)
 }

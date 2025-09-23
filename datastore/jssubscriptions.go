@@ -15,8 +15,7 @@ const (
 	SubscriptionsNamespace = "/_system/ds-subscriptions"
 )
 
-// SavedJSSubscription represents a JS subscription saved to datastore
-type SavedJSSubscription struct {
+type jsSubscription struct {
 	ID               string      `json:"id"`
 	Script           string      `json:"script"`
 	ExecutionTimeout int64       `json:"execution_timeout"` // milliseconds
@@ -28,7 +27,6 @@ type SavedJSSubscription struct {
 	UpdatedAt        time.Time   `json:"updated_at"`
 }
 
-// CreateJSSubscription creates and saves a JS subscription
 func (s *datastorage) CreateJSSubscription(ctx context.Context, id, script string, config *JSSubscriberConfig) error {
 
 	if id == "" {
@@ -49,12 +47,12 @@ func (s *datastorage) CreateJSSubscription(ctx context.Context, id, script strin
 		config.Script = script
 	}
 
-	jsSubscriber, err := NewJSSubscriber(*config)
+	subscriber, err := NewJSSubscriber(config)
 	if err != nil {
 		return fmt.Errorf("failed to create JS subscriber: %w", err)
 	}
 
-	savedSub := SavedJSSubscription{
+	savedSub := jsSubscription{
 		ID:               id,
 		Script:           script,
 		ExecutionTimeout: config.ExecutionTimeout.Milliseconds(),
@@ -63,7 +61,6 @@ func (s *datastorage) CreateJSSubscription(ctx context.Context, id, script strin
 		EventFilters:     config.EventFilters,
 		StrictMode:       config.StrictMode,
 		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
 	}
 
 	data, err := json.Marshal(savedSub)
@@ -81,13 +78,10 @@ func (s *datastorage) CreateJSSubscription(ctx context.Context, id, script strin
 		if chSub, ok := existing.(*ChannelSubscriber); ok {
 			chSub.Close()
 		}
-		if jsSub, ok := existing.(*JSSubscriber); ok {
-			jsSub.Close()
-		}
 		delete(s.subscribers, id)
 	}
 
-	s.subscribers[id] = jsSubscriber
+	s.subscribers[id] = subscriber
 	s.mu.Unlock()
 
 	return nil
@@ -101,10 +95,7 @@ func (s *datastorage) RemoveJSSubscription(ctx context.Context, id string) error
 
 	// Remove from memory
 	s.mu.Lock()
-	if existing, exists := s.subscribers[id]; exists {
-		if jsSub, ok := existing.(*JSSubscriber); ok {
-			jsSub.Close()
-		}
+	if _, exists := s.subscribers[id]; exists {
 		delete(s.subscribers, id)
 	}
 	s.mu.Unlock()
@@ -118,8 +109,7 @@ func (s *datastorage) RemoveJSSubscription(ctx context.Context, id string) error
 	return nil
 }
 
-// ListJSSubscriptions returns all saved JS subscriptions
-func (s *datastorage) ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscription, error) {
+func (s *datastorage) ListJSSubscriptions(ctx context.Context) ([]jsSubscription, error) {
 
 	q := query.Query{
 		Prefix: SubscriptionsNamespace,
@@ -131,7 +121,7 @@ func (s *datastorage) ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscri
 	}
 	defer results.Close()
 
-	var subscriptions []SavedJSSubscription
+	var subscriptions []jsSubscription
 
 	for {
 		select {
@@ -144,7 +134,7 @@ func (s *datastorage) ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscri
 			if result.Error != nil {
 				return nil, result.Error
 			}
-			var savedSub SavedJSSubscription
+			var savedSub jsSubscription
 			if err := json.Unmarshal(result.Value, &savedSub); err != nil {
 				// Skip invalid entries
 				continue
@@ -155,8 +145,7 @@ func (s *datastorage) ListJSSubscriptions(ctx context.Context) ([]SavedJSSubscri
 	}
 }
 
-// LoadJSSubscriptions loads and recreates all saved JS subscriptions
-func (s *datastorage) LoadJSSubscriptions(ctx context.Context) error {
+func (s *datastorage) loadJSSubscriptions(ctx context.Context) error {
 
 	subscriptions, err := s.ListJSSubscriptions(ctx)
 	if err != nil {
@@ -168,7 +157,7 @@ func (s *datastorage) LoadJSSubscriptions(ctx context.Context) error {
 
 	loadedCount := 0
 	for _, savedSub := range subscriptions {
-		config := JSSubscriberConfig{
+		config := &JSSubscriberConfig{
 			ID:               savedSub.ID,
 			Script:           savedSub.Script,
 			ExecutionTimeout: time.Duration(savedSub.ExecutionTimeout) * time.Millisecond,
@@ -188,9 +177,6 @@ func (s *datastorage) LoadJSSubscriptions(ctx context.Context) error {
 		if existing, exists := s.subscribers[savedSub.ID]; exists {
 			if chSub, ok := existing.(*ChannelSubscriber); ok {
 				chSub.Close()
-			}
-			if jsSub, ok := existing.(*JSSubscriber); ok {
-				jsSub.Close()
 			}
 			delete(s.subscribers, savedSub.ID)
 		}

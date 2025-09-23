@@ -2,31 +2,21 @@ package datastore
 
 import (
 	"context"
-	"crypto/md5"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/dop251/goja"
+	"ues-lite/js"
 )
 
-// JSEventData represents event data passed to JavaScript
-type JSEventData struct {
-	Type      string            `json:"type"`
-	Key       string            `json:"key"`
-	Value     string            `json:"value"` // base64 encoded
-	Timestamp int64             `json:"timestamp"`
+type jsEvent struct {
+	Type      string
+	Key       string
+	Value     string
+	Timestamp time.Time
 	Metadata  map[string]string `json:"metadata"`
 }
 
-// JSSubscriberConfig holds configuration for JS subscriber
 type JSSubscriberConfig struct {
 	ID               string
 	Script           string
@@ -34,25 +24,24 @@ type JSSubscriberConfig struct {
 	EnableNetworking bool
 	EnableLogging    bool
 	CustomLibraries  map[string]interface{}
-	EventFilters     []EventType
-	StrictMode       bool
+	// Extensions       map[string]interface{}
+	EventFilters []EventType
+	StrictMode   bool
 }
 
-// JSSubscriber executes JavaScript code on datastore events
-type JSSubscriber struct {
-	id         string
-	script     string
-	vm         *goja.Runtime
-	config     JSSubscriberConfig
-	mu         sync.RWMutex
-	logger     *log.Logger
-	httpClient *http.Client
+type jsSubscriber struct {
+	id     string
+	script string
+	// vm     *goja.Runtime
+	config *JSSubscriberConfig
+	mu     sync.RWMutex
+	logger *log.Logger
+	// httpClient *http.Client
 }
 
-var _ Subscriber = (*JSSubscriber)(nil)
+var _ Subscriber = (*jsSubscriber)(nil)
 
-// NewJSSubscriber creates a new JavaScript subscriber
-func NewJSSubscriber(config JSSubscriberConfig) (*JSSubscriber, error) {
+func NewJSSubscriber(config *JSSubscriberConfig) (*jsSubscriber, error) {
 
 	if config.ID == "" {
 		return nil, fmt.Errorf("subscriber ID cannot be empty")
@@ -62,28 +51,52 @@ func NewJSSubscriber(config JSSubscriberConfig) (*JSSubscriber, error) {
 		config.ExecutionTimeout = 5 * time.Second
 	}
 
-	subscriber := &JSSubscriber{
+	subscriber := &jsSubscriber{
 		id:     config.ID,
 		script: config.Script,
 		config: config,
-		logger: log.New(io.Discard, "", 0),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		// logger: log.New(io.Discard, "", 0),
+		// httpClient: &http.Client{
+		// 	Timeout: 30 * time.Second,
+		// },
 	}
 
 	if config.EnableLogging {
-		subscriber.logger = log.New(log.Writer(), fmt.Sprintf("[JSSubscriber-%s] ", config.ID), log.LstdFlags)
+		subscriber.logger = log.New(log.Writer(), fmt.Sprintf("[JS-%s] ", config.ID), log.LstdFlags)
 	}
 
-	if err := subscriber.initVM(); err != nil {
-		return nil, fmt.Errorf("failed to initialize JS runtime: %w", err)
-	}
+	// if err := subscriber.initVM(); err != nil {
+	// 	return nil, fmt.Errorf("failed to initialize JS runtime: %w", err)
+	// }
 
 	return subscriber, nil
 }
 
-func (js *JSSubscriber) initVM() error {
+func NewSimpleJSSubscriber(id, script string) (*jsSubscriber, error) {
+	config := &JSSubscriberConfig{
+		ID:               id,
+		Script:           script,
+		ExecutionTimeout: 5 * time.Second,
+		EnableLogging:    true,
+		EnableNetworking: true,
+	}
+	return NewJSSubscriber(config)
+}
+
+func NewFilteredJSSubscriber(id, script string, eventTypes ...EventType) (*jsSubscriber, error) {
+	config := &JSSubscriberConfig{
+		ID:               id,
+		Script:           script,
+		ExecutionTimeout: 5 * time.Second,
+		EnableLogging:    true,
+		EnableNetworking: true,
+		EventFilters:     eventTypes,
+	}
+	return NewJSSubscriber(config)
+}
+
+/*
+func (js *jsSubscriber) initVM() error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -119,7 +132,7 @@ func (js *JSSubscriber) initVM() error {
 	return nil
 }
 
-func (js *JSSubscriber) setupBuiltins(vm *goja.Runtime) {
+func (js *jsSubscriber) setupBuiltins(vm *goja.Runtime) {
 	// Console for logging
 	console := map[string]interface{}{
 		"log": func(args ...interface{}) {
@@ -309,24 +322,17 @@ func (js *JSSubscriber) httpPost(url string, data interface{}) map[string]interf
 		"headers": resp.Header,
 	}
 }
+*/
 
-func (js *JSSubscriber) ID() string {
-	return js.id
+func (s *jsSubscriber) ID() string {
+	return s.id
 }
 
-func (js *JSSubscriber) OnEvent(event Event) {
-	// Check if subscriber is closed
-	js.mu.RLock()
-	if js.vm == nil {
-		js.mu.RUnlock()
-		return
-	}
-	js.mu.RUnlock()
+func (s *jsSubscriber) OnEvent(ctx context.Context, event Event) {
 
-	// Check event filters
-	if len(js.config.EventFilters) > 0 {
+	if len(s.config.EventFilters) > 0 {
 		found := false
-		for _, filter := range js.config.EventFilters {
+		for _, filter := range s.config.EventFilters {
 			if event.Type == filter {
 				found = true
 				break
@@ -337,48 +343,40 @@ func (js *JSSubscriber) OnEvent(event Event) {
 		}
 	}
 
-	// Execute script with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), js.config.ExecutionTimeout)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, s.config.ExecutionTimeout)
 	defer cancel()
 
 	done := make(chan bool, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if js.config.EnableLogging {
-					js.logger.Printf("Script execution panic: %v", r)
+				if s.config.EnableLogging {
+					s.logger.Printf("Script execution panic: %v", r)
 				}
 			}
 			done <- true
 		}()
-
-		js.executeScript(event)
+		s.executeScript(ctx, event)
 	}()
 
 	select {
 	case <-done:
 		// Script completed
 	case <-ctx.Done():
-		if js.config.EnableLogging {
-			js.logger.Printf("Script execution timeout for event %s", event.Key.String())
+		if s.config.EnableLogging {
+			s.logger.Printf("Script execution timeout for event %s", event.Key.String())
 		}
 	}
 }
-func (js *JSSubscriber) executeScript(event Event) {
 
-	js.mu.Lock()
-	defer js.mu.Unlock()
+func (s *jsSubscriber) executeScript(ctx context.Context, event Event) {
 
-	// Double check VM is available
-	if js.vm == nil {
-		if js.config.EnableLogging {
-			js.logger.Printf("VM is nil, skipping event for subscriber %s", js.id)
-		}
-		return
-	}
-
-	// Prepare event data for JavaScript
 	eventType := "unknown"
+
 	switch event.Type {
 	case EventPut:
 		eventType = "put"
@@ -388,54 +386,31 @@ func (js *JSSubscriber) executeScript(event Event) {
 		eventType = "batch"
 	}
 
-	// Convert value to base64 for safe transport
 	var valueStr string
 	if event.Value != nil {
 		valueStr = string(event.Value)
 	}
 
-	jsEvent := JSEventData{
+	e := jsEvent{
 		Type:      eventType,
 		Key:       event.Key.String(),
 		Value:     valueStr,
-		Timestamp: event.Timestamp.Unix(),
-		Metadata:  make(map[string]string),
+		Timestamp: event.Timestamp,
+		Metadata:  map[string]string{},
 	}
 
-	// Add key parts as metadata
-	parts := strings.Split(strings.Trim(event.Key.String(), "/"), "/")
-	for i, part := range parts {
-		if part != "" {
-			jsEvent.Metadata[fmt.Sprintf("key_part_%d", i)] = part
+	if s.script != "" {
+		_, err := js.Eval(ctx, s.script, map[string]any{
+			"event": e,
+		})
+		if err != nil && s.config.EnableLogging {
+			s.logger.Printf("Script execution error: %v", err)
 		}
 	}
 
-	// Set event data in VM
-	js.vm.Set("event", jsEvent)
-
-	// Execute main handler function if it exists
-	// handlerFunc := js.vm.Get("onEvent")
-
-	// if handlerFunc != nil && !goja.IsUndefined(handlerFunc) && !goja.IsNull(handlerFunc) {
-	// 	if callable, ok := goja.AssertFunction(handlerFunc); ok {
-	// 		_, err := callable(goja.Undefined(), js.vm.ToValue(jsEvent))
-	// 		if err != nil && js.config.EnableLogging {
-	// 			js.logger.Printf("Handler function error: %v", err)
-	// 		}
-	// 	}
-	// } else {
-	// Execute the entire script if no handler function
-
-	if js.script != "" {
-		_, err := js.vm.RunString(js.script)
-		if err != nil && js.config.EnableLogging {
-			js.logger.Printf("Script execution error: %v", err)
-		}
-	}
-	// }
 }
 
-// UpdateScript safely updates the JavaScript code
+/*
 func (js *JSSubscriber) UpdateScript(newScript string) error {
 
 	js.mu.Lock()
@@ -456,15 +431,13 @@ func (js *JSSubscriber) UpdateScript(newScript string) error {
 	return nil
 }
 
-// GetScript returns current script
 func (js *JSSubscriber) GetScript() string {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
 	return js.script
 }
 
-// Close cleans up resources
-func (js *JSSubscriber) Close() error {
+func (js *jsSubscriber) Close() error {
 
 	js.mu.Lock()
 	defer js.mu.Unlock()
@@ -476,30 +449,4 @@ func (js *JSSubscriber) Close() error {
 
 	return nil
 }
-
-// Helper function to create JS subscriber with common settings
-func NewSimpleJSSubscriber(id, script string) (*JSSubscriber, error) {
-	config := JSSubscriberConfig{
-		ID:               id,
-		Script:           script,
-		ExecutionTimeout: 5 * time.Second,
-		EnableLogging:    true,
-		EnableNetworking: true,
-	}
-
-	return NewJSSubscriber(config)
-}
-
-// Helper function to create JS subscriber for specific event types
-func NewFilteredJSSubscriber(id, script string, eventTypes ...EventType) (*JSSubscriber, error) {
-	config := JSSubscriberConfig{
-		ID:               id,
-		Script:           script,
-		ExecutionTimeout: 5 * time.Second,
-		EnableLogging:    true,
-		EnableNetworking: true,
-		EventFilters:     eventTypes,
-	}
-
-	return NewJSSubscriber(config)
-}
+*/

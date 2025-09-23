@@ -15,6 +15,7 @@ import (
 	"ues-lite/datastore"
 
 	ds "github.com/ipfs/go-datastore"
+	"github.com/itchyny/gojq"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"github.com/urfave/cli/v2"
@@ -43,6 +44,7 @@ func exportJSONL(ctx *cli.Context) error {
 	format := ctx.String("format")
 	patch := ctx.StringSlice("patch")
 	extract := ctx.String("extract")
+	jqExpr := ctx.String("jq")
 	limit := ctx.Int("limit")
 	startKey := ctx.String("start")
 	endKey := ctx.String("end")
@@ -50,6 +52,17 @@ func exportJSONL(ctx *cli.Context) error {
 	skipSystem := ctx.Bool("skip-system")
 	compress := ctx.Bool("compress")
 	batchSize := ctx.Int("batch-size")
+
+	// Компилируем jq выражение если указано
+	var jqQuery *gojq.Query
+	if jqExpr != "" {
+		query, err := gojq.Parse(jqExpr)
+		if err != nil {
+			return fmt.Errorf("ошибка парсинга jq выражения '%s': %w", jqExpr, err)
+		}
+		jqQuery = query
+		fmt.Printf("🔍 jq выражение: %s\n", jqExpr)
+	}
 
 	// Создаем контекст с таймаутом
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 300*time.Second)
@@ -149,10 +162,12 @@ func exportJSONL(ctx *cli.Context) error {
 				}
 			}
 
+			// Применяем extract
 			if extract != "" {
 				jsonBytes = []byte(gjson.GetBytes(jsonBytes, extract).String())
 			}
 
+			// Применяем patch операции
 			if len(patch) > 0 {
 				for _, p := range patch {
 					var err error
@@ -191,6 +206,21 @@ func exportJSONL(ctx *cli.Context) error {
 				}
 			}
 
+			// Применяем jq выражение
+			if jqQuery != nil {
+				transformedBytes, err := applyJQExpression(jqQuery, jsonBytes, keyStr)
+				if err != nil {
+					fmt.Printf("⚠️  Ошибка применения jq к ключу %s: %v\n", keyStr, err)
+					skipped++
+					continue
+				}
+				if string(transformedBytes) == "null" {
+					skipped++
+					continue
+				}
+				jsonBytes = transformedBytes
+			}
+
 			batch = append(batch, string(jsonBytes))
 			exported++
 
@@ -222,6 +252,39 @@ done:
 	}
 
 	return nil
+}
+
+// applyJQExpression применяет jq выражение к JSON данным
+func applyJQExpression(query *gojq.Query, jsonBytes []byte, keyStr string) ([]byte, error) {
+	
+	// Парсим JSON в interface{}
+	var input interface{}
+	if err := json.Unmarshal(jsonBytes, &input); err != nil {
+		return nil, fmt.Errorf("ошибка парсинга JSON: %w", err)
+	}
+
+	// Применяем jq выражение
+	iter := query.Run(input)
+
+	// Получаем первый результат
+	result, ok := iter.Next()
+	if !ok {
+		// Если нет результата, возвращаем null
+		return []byte("null"), nil
+	}
+
+	// Проверяем на ошибку
+	if err, ok := result.(error); ok {
+		return nil, fmt.Errorf("ошибка выполнения jq: %w", err)
+	}
+
+	// Сериализуем результат обратно в JSON
+	transformedBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка сериализации результата jq: %w", err)
+	}
+
+	return transformedBytes, nil
 }
 
 func createExportRecord(kv datastore.KeyValue, format string, includeMetadata bool) (interface{}, error) {
@@ -410,8 +473,8 @@ func parseBool(s string) bool {
 
 func init() {
 	commands = append(commands, &cli.Command{
-		Name:    "export-jsonl",
-		Aliases: []string{"export", "dump"},
+		Name:    "export",
+		Aliases: []string{"dump"},
 		Usage:   "Экспортировать данные в JSON Lines формат",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -422,11 +485,15 @@ func init() {
 			},
 			&cli.StringSliceFlag{
 				Name:  "patch",
-				Usage: "",
+				Usage: "Патчи для JSON в формате 'path=value' или 'path=type#value' (type: int, float, bool, json)",
 			},
 			&cli.StringFlag{
 				Name:  "extract",
-				Usage: "",
+				Usage: "JSONPath для извлечения части значения",
+			},
+			&cli.StringFlag{
+				Name:  "jq",
+				Usage: "jq выражение для фильтрации/трансформации данных",
 			},
 			&cli.StringFlag{
 				Name:    "output",
@@ -489,11 +556,42 @@ func init() {
 - Сжатые файлы (.gz)
 - ZIP архивы (.zip)
 
+Обработка данных (применяется в порядке):
+1. extract: извлечение части JSON по JSONPath
+2. patch: изменение полей JSON
+3. jq: фильтрация/трансформация с помощью jq выражений
+
 Примеры:
+  # Простой экспорт
   ues-ds export-jsonl --prefix="/logs" --output=logs.jsonl
-  ues-ds export --format=full --metadata -o backup.zip -n 10000  
+  
+  # С метаданными  
+  ues-ds export --format=full --metadata -o backup.zip -n 10000
+  
+  # Фильтрация по диапазону ключей
   ues-ds dump --start="/user/a" --end="/user/z" --output=users.gz
+  
+  # Извлечение только значений
   ues-ds export-jsonl --prefix="/events" --format=value-only > events.json
-  ues-ds export --skip-system=false --output=full-backup.jsonl`,
+  
+  # Использование jq для фильтрации
+  ues-ds export --jq 'select(.age > 18)' --format=full --prefix="/users"
+  
+  # Трансформация данных с jq
+  ues-ds export --jq '{name: .name, email: .email}' --prefix="/users" -o users.jsonl
+  
+  # Фильтрация null значений
+  ues-ds export --jq 'select(. != null)' --prefix="/data"
+  
+  # Комплексная обработка
+  ues-ds export --extract=".user" --patch="active=bool#true" --jq 'select(.age > 21)' --prefix="/profiles"
+
+jq выражения:
+  select(.age > 18)          - фильтрация по условию
+  {name, email}              - извлечение только нужных полей  
+  .users[]                   - развертывание массива
+  select(has("email"))       - проверка наличия поля
+  map(select(.active))       - фильтрация массива
+  select(. != null)          - исключение null значений`,
 	})
 }
