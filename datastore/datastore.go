@@ -41,6 +41,10 @@ type Datastore interface {
 	QueryJQ(ctx context.Context, jqQuery string, opts *JQQueryOptions) (<-chan JQResult, <-chan error, error)
 	AggregateJQ(ctx context.Context, jqQuery string, opts *JQQueryOptions) (any, error)
 	QueryJQSingle(ctx context.Context, key ds.Key, jqQuery string) (interface{}, error)
+	//
+	Transform(ctx context.Context, key ds.Key, opts *TransformOptions) (*TransformSummary, error)
+	TransformWithJQ(ctx context.Context, key ds.Key, jqExpression string, opts *TransformOptions) (*TransformSummary, error)
+	TransformWithPatch(ctx context.Context, key ds.Key, patchOps []PatchOp, opts *TransformOptions) (*TransformSummary, error)
 }
 
 type KeyValue struct {

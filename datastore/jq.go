@@ -209,11 +209,11 @@ func (s *datastorage) queryJQCompiled(ctx context.Context, compiled *jqCompiledQ
 	}
 
 	queryCtx := ctx
-	if opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		queryCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
-	}
+	// if opts.Timeout > 0 {
+	// 	var cancel context.CancelFunc
+	// 	queryCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+	// 	defer cancel()
+	// }
 
 	resultChan := make(chan JQResult)
 	errorChan := make(chan error, 1)
