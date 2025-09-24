@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -12,6 +13,20 @@ import (
 	badger4 "github.com/ipfs/go-ds-badger4"
 )
 
+// TTLMonitorConfig - конфигурация TTL мониторинга
+type TTLMonitorConfig struct {
+	CheckInterval time.Duration // Интервал проверки истекших ключей
+	Enabled       bool          // Включен ли мониторинг
+	BufferSize    int           // Размер буфера для TTL событий
+}
+
+// TTLKeyInfo - информация о ключе с TTL
+type TTLKeyInfo struct {
+	Key       ds.Key
+	ExpiresAt time.Time
+	LastValue []byte // Сохраняем последнее значение для события
+}
+
 type Datastore interface {
 	ds.Datastore
 	ds.BatchingFeature
@@ -19,6 +34,8 @@ type Datastore interface {
 	ds.GCFeature
 	ds.PersistentFeature
 	ds.TTL
+	ViewManager
+	//
 	Iterator(ctx context.Context, prefix ds.Key, keysOnly bool) (<-chan KeyValue, <-chan error, error)
 	Merge(ctx context.Context, other Datastore) error
 	Clear(ctx context.Context) error
@@ -45,12 +62,34 @@ type Datastore interface {
 	Transform(ctx context.Context, key ds.Key, opts *TransformOptions) (*TransformSummary, error)
 	TransformWithJQ(ctx context.Context, key ds.Key, jqExpression string, opts *TransformOptions) (*TransformSummary, error)
 	TransformWithPatch(ctx context.Context, key ds.Key, patchOps []PatchOp, opts *TransformOptions) (*TransformSummary, error)
+	//
+	ExecuteView(ctx context.Context, id string) ([]ViewResult, error)
+	GetViewCached(ctx context.Context, id string) ([]ViewResult, bool, error)
+	CreateSimpleView(ctx context.Context, id, name, sourcePrefix, script string) (View, error)
+	//
+	// TTL мониторинг
+	EnableTTLMonitoring(config *TTLMonitorConfig) error
+	DisableTTLMonitoring() error
+	GetTTLMonitorConfig() *TTLMonitorConfig
+	//
+	// Методы стримминга
+	StreamTo(ctx context.Context, writer io.Writer, opts *StreamOptions) error
+	StreamEvents(ctx context.Context, writer io.Writer, opts *StreamOptions) error
+	StreamJSON(ctx context.Context, writer io.Writer, prefix ds.Key, includeKeys bool) error
+	StreamJSONL(ctx context.Context, writer io.Writer, prefix ds.Key, includeKeys bool) error
+	StreamCSV(ctx context.Context, writer io.Writer, prefix ds.Key, includeKeys bool) error
+	StreamSSE(ctx context.Context, writer io.Writer, headers map[string]string) error
+	StreamBinary(ctx context.Context, writer io.Writer, prefix ds.Key) error
+	StreamWithJQ(ctx context.Context, writer io.Writer, jqQuery string, format StreamFormat, prefix ds.Key) error
+	NewStreamPipeline(opts *StreamOptions) *StreamPipeline
 }
 
 type KeyValue struct {
 	Key   ds.Key
 	Value []byte
 }
+
+var _ Datastore = (*datastorage)(nil)
 
 var _ ds.Datastore = (*datastorage)(nil)
 var _ ds.PersistentDatastore = (*datastorage)(nil)
@@ -69,6 +108,14 @@ type datastorage struct {
 	wg          sync.WaitGroup
 	silentMode  bool
 	jqCache     *jqQueryCache
+	viewManager ViewManager
+	viewOnce    sync.Once
+	// TTL мониторинг
+	ttlMonitor *TTLMonitorConfig
+	ttlKeys    map[string]*TTLKeyInfo // ключи с TTL
+	ttlMu      sync.RWMutex
+	ttlDone    chan struct{} // для остановки TTL мониторинга
+	ttlWg      sync.WaitGroup
 }
 
 // Обновляем конструктор
@@ -85,6 +132,8 @@ func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 		eventQueue:  make(chan Event, 1000), // Buffer for event queue
 		done:        make(chan struct{}),
 		jqCache:     newJQQueryCache(), // Инициализируем кэш
+		ttlKeys:     make(map[string]*TTLKeyInfo),
+		ttlDone:     make(chan struct{}),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -97,7 +146,212 @@ func NewDatastorage(path string, opts *badger4.Options) (Datastore, error) {
 	ds.wg.Add(1)
 	go ds.eventDispatcher()
 
+	// Initialize ViewManager with lazy loading
+	ds.initViewManager()
+
 	return ds, nil
+}
+
+// EnableTTLMonitoring - включает мониторинг TTL
+func (s *datastorage) EnableTTLMonitoring(config *TTLMonitorConfig) error {
+	if config == nil {
+		config = &TTLMonitorConfig{
+			CheckInterval: 30 * time.Second,
+			Enabled:       true,
+			BufferSize:    100,
+		}
+	}
+
+	s.ttlMu.Lock()
+	defer s.ttlMu.Unlock()
+
+	// Останавливаем предыдущий мониторинг если был активен
+	if s.ttlMonitor != nil && s.ttlMonitor.Enabled {
+		s.stopTTLMonitoring()
+	}
+
+	s.ttlMonitor = config
+
+	if config.Enabled {
+		s.ttlWg.Add(1)
+		go s.ttlMonitorLoop()
+	}
+
+	return nil
+}
+
+// DisableTTLMonitoring - отключает мониторинг TTL
+func (s *datastorage) DisableTTLMonitoring() error {
+	s.ttlMu.Lock()
+	defer s.ttlMu.Unlock()
+
+	if s.ttlMonitor != nil {
+		s.stopTTLMonitoring()
+		s.ttlMonitor.Enabled = false
+	}
+
+	return nil
+}
+
+// GetTTLMonitorConfig - возвращает текущую конфигурацию TTL мониторинга
+func (s *datastorage) GetTTLMonitorConfig() *TTLMonitorConfig {
+	s.ttlMu.RLock()
+	defer s.ttlMu.RUnlock()
+
+	if s.ttlMonitor == nil {
+		return nil
+	}
+
+	// Возвращаем копию
+	return &TTLMonitorConfig{
+		CheckInterval: s.ttlMonitor.CheckInterval,
+		Enabled:       s.ttlMonitor.Enabled,
+		BufferSize:    s.ttlMonitor.BufferSize,
+	}
+}
+
+// stopTTLMonitoring - внутренний метод для остановки мониторинга (вызывать под mutex)
+func (s *datastorage) stopTTLMonitoring() {
+	close(s.ttlDone)
+	s.ttlWg.Wait()
+	s.ttlDone = make(chan struct{}) // создаем новый канал для возможного перезапуска
+}
+
+// ttlMonitorLoop - основной цикл мониторинга TTL
+func (s *datastorage) ttlMonitorLoop() {
+	defer s.ttlWg.Done()
+
+	s.ttlMu.RLock()
+	interval := s.ttlMonitor.CheckInterval
+	s.ttlMu.RUnlock()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ttlDone:
+			return
+		case <-ticker.C:
+			s.checkExpiredTTLKeys()
+		}
+	}
+}
+
+// checkExpiredTTLKeys - проверяет истекшие TTL ключи
+func (s *datastorage) checkExpiredTTLKeys() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Получаем все ключи и проверяем их TTL
+	keysCh, errCh, err := s.Keys(ctx, ds.NewKey("/"))
+	if err != nil {
+		log.Printf("ошибка получения ключей для TTL проверки: %v", err)
+		return
+	}
+
+	now := time.Now()
+	expiredKeys := make([]ds.Key, 0)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, ok := <-errCh:
+			if ok && err != nil {
+				log.Printf("ошибка при проверке TTL ключей: %v", err)
+				return
+			}
+		case key, ok := <-keysCh:
+			if !ok {
+				// Генерируем события для всех истекших ключей
+				s.processExpiredKeys(ctx, expiredKeys, now)
+				return
+			}
+
+			// Проверяем TTL для этого ключа
+			expiration, err := s.Datastore.GetExpiration(ctx, key)
+			if err != nil {
+				// Ключ не имеет TTL или ошибка получения
+				continue
+			}
+
+			if now.After(expiration) {
+				expiredKeys = append(expiredKeys, key)
+			}
+		}
+	}
+}
+
+// processExpiredKeys - обрабатывает истекшие ключи
+func (s *datastorage) processExpiredKeys(ctx context.Context, expiredKeys []ds.Key, expiredAt time.Time) {
+	for _, key := range expiredKeys {
+		// Пытаемся получить последнее значение перед удалением
+		var lastValue []byte
+		if value, err := s.Datastore.Get(ctx, key); err == nil {
+			lastValue = value
+		}
+
+		// Генерируем событие TTL истечения
+		s.publishTTLExpiredEvent(key, lastValue, expiredAt)
+	}
+}
+
+// publishTTLExpiredEvent - публикует событие истечения TTL
+func (s *datastorage) publishTTLExpiredEvent(key ds.Key, lastValue []byte, expiredAt time.Time) {
+	event := Event{
+		Type:      EventTTLExpired,
+		Key:       key,
+		Value:     lastValue,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"expired_at": expiredAt.Format(time.RFC3339),
+			"ttl_event":  true,
+		},
+	}
+
+	select {
+	case s.eventQueue <- event:
+	default:
+		// Drop event if queue is full to prevent blocking
+		log.Printf("TTL event queue full, dropping event for key: %s", key.String())
+	}
+}
+
+// Переопределяем PutWithTTL для отслеживания TTL ключей
+func (s *datastorage) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
+	err := s.Datastore.PutWithTTL(ctx, key, value, ttl)
+	if err != nil {
+		return err
+	}
+
+	// Публикуем обычное событие Put
+	if !s.silentMode {
+		s.publishEvent(EventPut, key, value)
+	}
+
+	// Если TTL мониторинг включен, регистрируем ключ
+	s.ttlMu.RLock()
+	monitorEnabled := s.ttlMonitor != nil && s.ttlMonitor.Enabled
+	s.ttlMu.RUnlock()
+
+	if monitorEnabled {
+		s.registerTTLKey(key, time.Now().Add(ttl), value)
+	}
+
+	return nil
+}
+
+// registerTTLKey - регистрирует ключ с TTL для мониторинга
+func (s *datastorage) registerTTLKey(key ds.Key, expiresAt time.Time, value []byte) {
+	s.ttlMu.Lock()
+	defer s.ttlMu.Unlock()
+
+	s.ttlKeys[key.String()] = &TTLKeyInfo{
+		Key:       key,
+		ExpiresAt: expiresAt,
+		LastValue: value,
+	}
 }
 
 func (s *datastorage) eventDispatcher() {
@@ -189,6 +443,11 @@ func (s *datastorage) Delete(ctx context.Context, key ds.Key) error {
 			s.publishEvent(EventDelete, key, nil)
 		}
 	}
+
+	// Удаляем из TTL мониторинга если есть
+	s.ttlMu.Lock()
+	delete(s.ttlKeys, key.String())
+	s.ttlMu.Unlock()
 	return err
 }
 
@@ -327,6 +586,13 @@ func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <
 // Close method to clean up resources
 func (s *datastorage) Close() error {
 
+	// Останавливаем TTL мониторинг
+	s.ttlMu.Lock()
+	if s.ttlMonitor != nil && s.ttlMonitor.Enabled {
+		s.stopTTLMonitoring()
+	}
+	s.ttlMu.Unlock()
+
 	close(s.done)
 	s.wg.Wait()
 
@@ -358,6 +624,15 @@ func (s *datastorage) Close() error {
 	for _, subscriber := range s.subscribers {
 		if chSub, ok := subscriber.(*ChannelSubscriber); ok {
 			chSub.Close()
+		}
+	}
+
+	// Close ViewManager if initialized
+	if s.viewManager != nil {
+		if closer, ok := s.viewManager.(*DefaultViewManager); ok {
+			if err := closer.Close(); err != nil {
+				log.Printf("ошибка закрытия ViewManager: %v", err)
+			}
 		}
 	}
 

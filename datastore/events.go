@@ -13,6 +13,7 @@ const (
 	EventPut EventType = iota
 	EventDelete
 	EventBatch
+	EventTTLExpired // Новое событие для истечения TTL
 )
 
 type Event struct {
@@ -20,6 +21,8 @@ type Event struct {
 	Key       ds.Key
 	Value     []byte
 	Timestamp time.Time
+	// Дополнительные метаданные для TTL событий
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
 type Subscriber interface {
