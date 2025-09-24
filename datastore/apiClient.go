@@ -10,16 +10,82 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"ues-lite/datastore"
 
 	ds "github.com/ipfs/go-datastore"
 )
+
+// Структуры для API запросов и ответов
+type SearchRequest struct {
+	Query         string `json:"query"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	KeysOnly      bool   `json:"keys_only,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+}
+
+type SubscriptionRequest struct {
+	ID               string   `json:"id"`
+	Script           string   `json:"script"`
+	ExecutionTimeout int      `json:"execution_timeout,omitempty"`
+	EnableNetworking bool     `json:"enable_networking,omitempty"`
+	EnableLogging    bool     `json:"enable_logging,omitempty"`
+	EventFilters     []string `json:"event_filters,omitempty"`
+	StrictMode       bool     `json:"strict_mode,omitempty"`
+}
+
+type BatchRequest struct {
+	Operations []BatchOperation `json:"operations"`
+}
+
+type BatchOperation struct {
+	Op    string        `json:"op"` // put, delete
+	Key   string        `json:"key"`
+	Value string        `json:"value,omitempty"`
+	TTL   time.Duration `json:"ttl,omitempty"`
+}
+
+type JQQueryRequest struct {
+	Query            string        `json:"query"`
+	Prefix           string        `json:"prefix,omitempty"`
+	Limit            int           `json:"limit,omitempty"`
+	Timeout          time.Duration `json:"timeout,omitempty"`
+	TreatAsString    bool          `json:"treat_as_string,omitempty"`
+	IgnoreParseError bool          `json:"ignore_parse_error,omitempty"`
+}
+
+type JQSingleRequest struct {
+	Query string `json:"query"`
+}
+
+type TransformRequest struct {
+	Key     string            `json:"key,omitempty"`
+	Prefix  string            `json:"prefix,omitempty"`
+	Options *TransformOptions `json:"options"`
+}
+
+type TransformJQRequest struct {
+	Key          string            `json:"key,omitempty"`
+	Prefix       string            `json:"prefix,omitempty"`
+	JQExpression string            `json:"jq_expression"`
+	Options      *TransformOptions `json:"options,omitempty"`
+}
+
+type TransformPatchRequest struct {
+	Key      string            `json:"key,omitempty"`
+	Prefix   string            `json:"prefix,omitempty"`
+	PatchOps []PatchOp         `json:"patch_ops"`
+	Options  *TransformOptions `json:"options,omitempty"`
+}
+
+type ViewRequest struct {
+	Config ViewConfig `json:",inline"`
+}
 
 // APIClient представляет клиент для работы с REST API
 type APIClient struct {
 	client  *http.Client
 	baseURL string
 	isUnix  bool
+	token   string
 }
 
 // NewAPIClient создает новый API клиент
@@ -55,18 +121,21 @@ func NewAPIClient(endpoint string) (*APIClient, error) {
 	}, nil
 }
 
+// NewAPIClientWithAuth создает API клиент с авторизацией
+func NewAPIClientWithAuth(endpoint, token string) (*APIClient, error) {
+	client, err := NewAPIClient(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client.token = token
+	return client, nil
+}
+
 // Вспомогательные методы для HTTP запросов
 
 func (c *APIClient) get(endpoint string) (*APIResponse, error) {
-	url := c.baseURL + "/api" + endpoint
-
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP GET ошибка: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return c.parseResponse(resp)
+	url := c.baseURL + "/api/v1" + endpoint
+	return c.doRequest("GET", url, nil)
 }
 
 func (c *APIClient) post(endpoint string, body interface{}) (*APIResponse, error) {
@@ -82,7 +151,7 @@ func (c *APIClient) delete(endpoint string) (*APIResponse, error) {
 }
 
 func (c *APIClient) request(method, endpoint string, body interface{}) (*APIResponse, error) {
-	url := c.baseURL + "/api" + endpoint
+	url := c.baseURL + "/api/v1" + endpoint
 
 	var reqBody io.Reader
 	if body != nil {
@@ -93,13 +162,22 @@ func (c *APIClient) request(method, endpoint string, body interface{}) (*APIResp
 		reqBody = bytes.NewReader(jsonData)
 	}
 
-	req, err := http.NewRequest(method, url, reqBody)
+	return c.doRequest(method, url, reqBody)
+}
+
+func (c *APIClient) doRequest(method, url string, body io.Reader) (*APIResponse, error) {
+	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания запроса: %w", err)
 	}
 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Добавляем авторизацию если есть токен
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	resp, err := c.client.Do(req)
@@ -129,18 +207,21 @@ func (c *APIClient) parseResponse(resp *http.Response) (*APIResponse, error) {
 	return &apiResp, nil
 }
 
-// Методы для работы с датастором через API
+// Базовые методы датастора
 
 func (c *APIClient) Get(ctx context.Context, key ds.Key) ([]byte, error) {
 	endpoint := fmt.Sprintf("/keys%s?format=raw", key.String())
+	url := c.baseURL + "/api/v1" + endpoint
 
-	url := c.baseURL + "/api" + endpoint
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("Accept", "text/plain")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -162,7 +243,7 @@ func (c *APIClient) Get(ctx context.Context, key ds.Key) ([]byte, error) {
 
 func (c *APIClient) Put(ctx context.Context, key ds.Key, value []byte) error {
 	endpoint := fmt.Sprintf("/keys%s", key.String())
-	url := c.baseURL + "/api" + endpoint
+	url := c.baseURL + "/api/v1" + endpoint
 
 	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(value))
 	if err != nil {
@@ -170,6 +251,9 @@ func (c *APIClient) Put(ctx context.Context, key ds.Key, value []byte) error {
 	}
 
 	req.Header.Set("Content-Type", "text/plain")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -186,65 +270,44 @@ func (c *APIClient) Put(ctx context.Context, key ds.Key, value []byte) error {
 }
 
 func (c *APIClient) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
-	endpoint := fmt.Sprintf("/keys%s?ttl=%s", key.String(), ttl.String())
-	url := c.baseURL + "/api" + endpoint
-
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(value))
-	if err != nil {
-		return err
+	reqBody := struct {
+		Value string        `json:"value"`
+		TTL   time.Duration `json:"ttl"`
+	}{
+		Value: string(value),
+		TTL:   ttl,
 	}
 
-	req.Header.Set("Content-Type", "text/plain")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	endpoint := fmt.Sprintf("/keys%s", key.String())
+	_, err := c.request("PUT", endpoint, reqBody)
+	return err
 }
 
 func (c *APIClient) Delete(ctx context.Context, key ds.Key) error {
 	endpoint := fmt.Sprintf("/keys%s", key.String())
-
-	apiResp, err := c.delete(endpoint)
-	if err != nil {
-		return err
-	}
-
-	_ = apiResp // Игнорируем успешный ответ
-	return nil
+	_, err := c.delete(endpoint)
+	return err
 }
 
 func (c *APIClient) Has(ctx context.Context, key ds.Key) (bool, error) {
 	endpoint := fmt.Sprintf("/keys%s/info", key.String())
-
 	_, err := c.get(endpoint)
 	if err != nil {
-		if strings.Contains(err.Error(), "Ключ не найден") {
+		if strings.Contains(err.Error(), "Ключ не найден") || strings.Contains(err.Error(), "404") {
 			return false, nil
 		}
 		return false, err
 	}
-
 	return true, nil
 }
 
 func (c *APIClient) GetSize(ctx context.Context, key ds.Key) (int, error) {
 	endpoint := fmt.Sprintf("/keys%s/info", key.String())
-
 	apiResp, err := c.get(endpoint)
 	if err != nil {
 		return 0, err
 	}
 
-	// Извлекаем размер из ответа
 	if data, ok := apiResp.Data.(map[string]interface{}); ok {
 		if size, ok := data["size"].(float64); ok {
 			return int(size), nil
@@ -253,6 +316,39 @@ func (c *APIClient) GetSize(ctx context.Context, key ds.Key) (int, error) {
 
 	return 0, fmt.Errorf("неожиданный формат ответа")
 }
+
+func (c *APIClient) GetExpiration(ctx context.Context, key ds.Key) (time.Time, error) {
+	endpoint := fmt.Sprintf("/keys%s/info", key.String())
+	apiResp, err := c.get(endpoint)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if ttl, ok := data["ttl"].(string); ok && ttl != "" {
+			duration, err := time.ParseDuration(ttl)
+			if err != nil {
+				return time.Time{}, err
+			}
+			return time.Now().Add(duration), nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("ключ не имеет TTL")
+}
+
+func (c *APIClient) SetTTL(ctx context.Context, key ds.Key, ttl time.Duration) error {
+	// Получаем текущее значение
+	value, err := c.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	// Перезаписываем с TTL
+	return c.PutWithTTL(ctx, key, value, ttl)
+}
+
+// Расширенные методы
 
 func (c *APIClient) ListKeys(ctx context.Context, prefix string, keysOnly bool, limit int) ([]interface{}, error) {
 	endpoint := fmt.Sprintf("/keys?prefix=%s&keys_only=%t", prefix, keysOnly)
@@ -314,7 +410,316 @@ func (c *APIClient) Clear(ctx context.Context) error {
 	return err
 }
 
-func (c *APIClient) CreateSubscription(ctx context.Context, id, script string, config *datastore.JSSubscriberConfig) error {
+// Batch операции
+
+func (c *APIClient) ExecuteBatch(ctx context.Context, operations []BatchOperation) error {
+	req := BatchRequest{Operations: operations}
+	_, err := c.post("/batch", req)
+	return err
+}
+
+// JQ запросы
+
+func (c *APIClient) QueryJQ(ctx context.Context, query string, opts *JQQueryOptions) ([]map[string]interface{}, error) {
+	req := JQQueryRequest{
+		Query: query,
+	}
+
+	if opts != nil {
+		req.Prefix = opts.Prefix.String()
+		req.Limit = opts.Limit
+		req.Timeout = opts.Timeout
+		req.TreatAsString = opts.TreatAsString
+		req.IgnoreParseError = opts.IgnoreParseError
+	}
+
+	apiResp, err := c.post("/query", req)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if results, ok := data["results"].([]interface{}); ok {
+			var queryResults []map[string]interface{}
+			for _, item := range results {
+				if resultMap, ok := item.(map[string]interface{}); ok {
+					queryResults = append(queryResults, resultMap)
+				}
+			}
+			return queryResults, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) AggregateJQ(ctx context.Context, query string, opts *JQQueryOptions) (interface{}, error) {
+	req := JQQueryRequest{
+		Query: query,
+	}
+
+	if opts != nil {
+		req.Prefix = opts.Prefix.String()
+		req.Timeout = opts.Timeout
+		req.TreatAsString = opts.TreatAsString
+		req.IgnoreParseError = opts.IgnoreParseError
+	}
+
+	apiResp, err := c.post("/query/aggregate", req)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if result, ok := data["result"]; ok {
+			return result, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) QueryJQSingle(ctx context.Context, key ds.Key, query string) (interface{}, error) {
+	endpoint := fmt.Sprintf("/keys%s/query", key.String())
+	req := JQSingleRequest{Query: query}
+
+	apiResp, err := c.post(endpoint, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if result, ok := data["result"]; ok {
+			return result, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+// Transform операции
+
+func (c *APIClient) Transform(ctx context.Context, key ds.Key, opts *TransformOptions) (*TransformSummary, error) {
+	req := TransformRequest{
+		Options: opts,
+	}
+	if key.String() != "/" {
+		req.Key = key.String()
+	}
+
+	apiResp, err := c.post("/transform", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var summary TransformSummary
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		bytes, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(bytes, &summary); err != nil {
+			return nil, err
+		}
+		return &summary, nil
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) TransformWithJQ(ctx context.Context, key ds.Key, jqExpression string, opts *TransformOptions) (*TransformSummary, error) {
+	req := TransformJQRequest{
+		JQExpression: jqExpression,
+		Options:      opts,
+	}
+	if key.String() != "/" {
+		req.Key = key.String()
+	}
+
+	apiResp, err := c.post("/transform/jq", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var summary TransformSummary
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		bytes, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(bytes, &summary); err != nil {
+			return nil, err
+		}
+		return &summary, nil
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) TransformWithPatch(ctx context.Context, key ds.Key, patchOps []PatchOp, opts *TransformOptions) (*TransformSummary, error) {
+	req := TransformPatchRequest{
+		PatchOps: patchOps,
+		Options:  opts,
+	}
+	if key.String() != "/" {
+		req.Key = key.String()
+	}
+
+	apiResp, err := c.post("/transform/patch", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var summary TransformSummary
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		bytes, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(bytes, &summary); err != nil {
+			return nil, err
+		}
+		return &summary, nil
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+// Views
+
+func (c *APIClient) ListViews(ctx context.Context) ([]ViewConfig, error) {
+	apiResp, err := c.get("/views")
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if views, ok := data["views"].([]interface{}); ok {
+			var configs []ViewConfig
+			for _, view := range views {
+				if viewMap, ok := view.(map[string]interface{}); ok {
+					if config, ok := viewMap["config"].(map[string]interface{}); ok {
+						bytes, err := json.Marshal(config)
+						if err != nil {
+							continue
+						}
+						var viewConfig ViewConfig
+						if err := json.Unmarshal(bytes, &viewConfig); err != nil {
+							continue
+						}
+						configs = append(configs, viewConfig)
+					}
+				}
+			}
+			return configs, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) CreateView(ctx context.Context, config ViewConfig) error {
+	_, err := c.post("/views", config)
+	return err
+}
+
+func (c *APIClient) GetView(ctx context.Context, id string) (*ViewConfig, error) {
+	endpoint := fmt.Sprintf("/views/%s", id)
+	apiResp, err := c.get(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if config, ok := data["config"].(map[string]interface{}); ok {
+			bytes, err := json.Marshal(config)
+			if err != nil {
+				return nil, err
+			}
+			var viewConfig ViewConfig
+			if err := json.Unmarshal(bytes, &viewConfig); err != nil {
+				return nil, err
+			}
+			return &viewConfig, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) UpdateView(ctx context.Context, id string, config ViewConfig) error {
+	endpoint := fmt.Sprintf("/views/%s", id)
+	config.ID = id
+	_, err := c.put(endpoint, config)
+	return err
+}
+
+func (c *APIClient) DeleteView(ctx context.Context, id string) error {
+	endpoint := fmt.Sprintf("/views/%s", id)
+	_, err := c.delete(endpoint)
+	return err
+}
+
+func (c *APIClient) ExecuteView(ctx context.Context, id string) ([]ViewResult, error) {
+	endpoint := fmt.Sprintf("/views/%s/execute", id)
+	apiResp, err := c.post(endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		if results, ok := data["results"].([]interface{}); ok {
+			var viewResults []ViewResult
+			bytes, err := json.Marshal(results)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(bytes, &viewResults); err != nil {
+				return nil, err
+			}
+			return viewResults, nil
+		}
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+func (c *APIClient) RefreshView(ctx context.Context, id string) error {
+	endpoint := fmt.Sprintf("/views/%s/refresh", id)
+	_, err := c.post(endpoint, nil)
+	return err
+}
+
+func (c *APIClient) RefreshAllViews(ctx context.Context) error {
+	_, err := c.post("/views/refresh", nil)
+	return err
+}
+
+func (c *APIClient) GetViewStats(ctx context.Context, id string) (*ViewStats, error) {
+	endpoint := fmt.Sprintf("/views/%s/stats", id)
+	apiResp, err := c.get(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	var stats ViewStats
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		bytes, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(bytes, &stats); err != nil {
+			return nil, err
+		}
+		return &stats, nil
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
+
+// Подписки
+
+func (c *APIClient) CreateSubscription(ctx context.Context, id, script string, config *JSSubscriberConfig) error {
 	req := SubscriptionRequest{
 		ID:     id,
 		Script: script,
@@ -329,12 +734,14 @@ func (c *APIClient) CreateSubscription(ctx context.Context, id, script string, c
 		// Преобразуем EventType в строки
 		for _, eventType := range config.EventFilters {
 			switch eventType {
-			case datastore.EventPut:
+			case EventPut:
 				req.EventFilters = append(req.EventFilters, "put")
-			case datastore.EventDelete:
+			case EventDelete:
 				req.EventFilters = append(req.EventFilters, "delete")
-			case datastore.EventBatch:
+			case EventBatch:
 				req.EventFilters = append(req.EventFilters, "batch")
+			case EventTTLExpired:
+				req.EventFilters = append(req.EventFilters, "ttl_expired")
 			}
 		}
 	}
@@ -349,7 +756,7 @@ func (c *APIClient) RemoveSubscription(ctx context.Context, id string) error {
 	return err
 }
 
-func (c *APIClient) ListSubscriptions(ctx context.Context) ([]datastore.SavedJSSubscription, error) {
+func (c *APIClient) ListSubscriptions(ctx context.Context) ([]jsSubscription, error) {
 	apiResp, err := c.get("/subscriptions")
 	if err != nil {
 		return nil, err
@@ -357,7 +764,7 @@ func (c *APIClient) ListSubscriptions(ctx context.Context) ([]datastore.SavedJSS
 
 	if data, ok := apiResp.Data.(map[string]interface{}); ok {
 		if subsData, ok := data["subscriptions"].([]interface{}); ok {
-			var subscriptions []datastore.SavedJSSubscription
+			var subscriptions []jsSubscription
 
 			// Конвертируем через JSON для корректного парсинга
 			jsonData, err := json.Marshal(subsData)
@@ -376,289 +783,91 @@ func (c *APIClient) ListSubscriptions(ctx context.Context) ([]datastore.SavedJSS
 	return nil, fmt.Errorf("неожиданный формат ответа")
 }
 
+// Система
+
+func (c *APIClient) SetMode(ctx context.Context, silent bool) error {
+	req := map[string]bool{"silent": silent}
+	_, err := c.post("/system/mode", req)
+	return err
+}
+
+func (c *APIClient) GC(ctx context.Context) error {
+	_, err := c.post("/system/gc", nil)
+	return err
+}
+
+// Утилиты
+
 func (c *APIClient) Health() error {
 	_, err := c.get("/health")
 	return err
 }
 
-// RemoteDatastore адаптер для работы с удаленным датастором через API
-type RemoteDatastore struct {
-	client *APIClient
-}
-
-func NewRemoteDatastore(endpoint string) (*RemoteDatastore, error) {
-	client, err := NewAPIClient(endpoint)
+func (c *APIClient) GetDocs() (string, error) {
+	url := c.baseURL + "/api/v1/docs"
+	resp, err := c.client.Get(url)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	defer resp.Body.Close()
 
-	// Проверяем соединение
-	if err := client.Health(); err != nil {
-		return nil, fmt.Errorf("не удалось подключиться к серверу: %w", err)
-	}
-
-	return &RemoteDatastore{client: client}, nil
-}
-
-// Реализация интерфейса ds.Datastore
-
-func (rd *RemoteDatastore) Get(ctx context.Context, key ds.Key) ([]byte, error) {
-	return rd.client.Get(ctx, key)
-}
-
-func (rd *RemoteDatastore) Put(ctx context.Context, key ds.Key, value []byte) error {
-	return rd.client.Put(ctx, key, value)
-}
-
-func (rd *RemoteDatastore) Delete(ctx context.Context, key ds.Key) error {
-	return rd.client.Delete(ctx, key)
-}
-
-func (rd *RemoteDatastore) Has(ctx context.Context, key ds.Key) (bool, error) {
-	return rd.client.Has(ctx, key)
-}
-
-func (rd *RemoteDatastore) GetSize(ctx context.Context, key ds.Key) (int, error) {
-	return rd.client.GetSize(ctx, key)
-}
-
-func (rd *RemoteDatastore) Query(ctx context.Context, q ds.Query) (ds.Results, error) {
-	// Упрощенная реализация Query - используем ListKeys
-	keys, err := rd.client.ListKeys(ctx, q.Prefix, q.KeysOnly, 0)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	// Создаем channel-based результат
-	results := make(chan ds.Result)
+	return string(body), nil
+}
 
-	go func() {
-		defer close(results)
+// Стрим операции (упрощенные версии)
 
-		for _, item := range keys {
-			if q.KeysOnly {
-				if keyStr, ok := item.(string); ok {
-					results <- ds.Result{
-						Entry: ds.Entry{Key: keyStr},
-					}
-				}
-			} else {
-				if keyInfo, ok := item.(map[string]interface{}); ok {
-					if keyStr, ok := keyInfo["key"].(string); ok {
-						if valueStr, ok := keyInfo["value"].(string); ok {
-							results <- ds.Result{
-								Entry: ds.Entry{
-									Key:   keyStr,
-									Value: []byte(valueStr),
-								},
-							}
-						}
-					}
-				}
-			}
+func (c *APIClient) StreamTo(ctx context.Context, writer io.Writer, opts *StreamOptions) error {
+	endpoint := "/stream"
+	params := []string{}
+
+	if opts != nil {
+		if opts.Format != "" {
+			params = append(params, fmt.Sprintf("format=%s", opts.Format))
 		}
-	}()
-
-	return ds.ResultsFromChannel(results), nil
-}
-
-func (rd *RemoteDatastore) Batch(ctx context.Context) (ds.Batch, error) {
-	return &RemoteBatch{
-		client: rd.client,
-		ctx:    ctx,
-		ops:    make([]batchOperation, 0),
-	}, nil
-}
-
-func (rd *RemoteDatastore) Close() error {
-	// HTTP клиент не требует явного закрытия
-	return nil
-}
-
-// RemoteBatch реализует ds.Batch для удаленного датастора
-type RemoteBatch struct {
-	client *APIClient
-	ctx    context.Context
-	ops    []batchOperation
-}
-
-type batchOperation struct {
-	isDelete bool
-	key      ds.Key
-	value    []byte
-}
-
-func (rb *RemoteBatch) Put(ctx context.Context, key ds.Key, value []byte) error {
-	rb.ops = append(rb.ops, batchOperation{
-		isDelete: false,
-		key:      key,
-		value:    value,
-	})
-	return nil
-}
-
-func (rb *RemoteBatch) Delete(ctx context.Context, key ds.Key) error {
-	rb.ops = append(rb.ops, batchOperation{
-		isDelete: true,
-		key:      key,
-	})
-	return nil
-}
-
-func (rb *RemoteBatch) Commit(ctx context.Context) error {
-	// Выполняем все операции последовательно
-	// В реальной реализации можно было бы сделать batch API endpoint
-	for _, op := range rb.ops {
-		if op.isDelete {
-			if err := rb.client.Delete(ctx, op.key); err != nil {
-				return err
-			}
-		} else {
-			if err := rb.client.Put(ctx, op.key, op.value); err != nil {
-				return err
-			}
+		if opts.Prefix.String() != "" {
+			params = append(params, fmt.Sprintf("prefix=%s", opts.Prefix.String()))
+		}
+		if opts.JQFilter != "" {
+			params = append(params, fmt.Sprintf("jq=%s", opts.JQFilter))
+		}
+		if opts.IncludeKeys {
+			params = append(params, "include_keys=true")
+		}
+		if opts.Limit > 0 {
+			params = append(params, fmt.Sprintf("limit=%d", opts.Limit))
 		}
 	}
 
-	// Очищаем операции после коммита
-	rb.ops = rb.ops[:0]
-	return nil
-}
+	if len(params) > 0 {
+		endpoint += "?" + strings.Join(params, "&")
+	}
 
-// Дополнительные методы RemoteDatastore для специфичных функций
-
-func (rd *RemoteDatastore) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
-	return rd.client.PutWithTTL(ctx, key, value, ttl)
-}
-
-func (rd *RemoteDatastore) ListKeys(ctx context.Context, prefix string, keysOnly bool, limit int) ([]interface{}, error) {
-	return rd.client.ListKeys(ctx, prefix, keysOnly, limit)
-}
-
-func (rd *RemoteDatastore) Search(ctx context.Context, query string, caseSensitive, keysOnly bool, limit int) ([]interface{}, error) {
-	return rd.client.Search(ctx, query, caseSensitive, keysOnly, limit)
-}
-
-func (rd *RemoteDatastore) GetStats(ctx context.Context) (map[string]interface{}, error) {
-	return rd.client.GetStats(ctx)
-}
-
-func (rd *RemoteDatastore) Clear(ctx context.Context) error {
-	return rd.client.Clear(ctx)
-}
-
-func (rd *RemoteDatastore) CreateJSSubscription(ctx context.Context, id, script string, config *datastore.JSSubscriberConfig) error {
-	return rd.client.CreateSubscription(ctx, id, script, config)
-}
-
-func (rd *RemoteDatastore) RemoveJSSubscription(ctx context.Context, id string) error {
-	return rd.client.RemoveSubscription(ctx, id)
-}
-
-func (rd *RemoteDatastore) ListJSSubscriptions(ctx context.Context) ([]datastore.SavedJSSubscription, error) {
-	return rd.client.ListSubscriptions(ctx)
-}
-
-var _ datastore.Datastore = (*RemoteDatastoreAdapter)(nil)
-
-// RemoteDatastoreAdapter адаптирует RemoteDatastore к DatastoreInterface
-type RemoteDatastoreAdapter struct {
-	*RemoteDatastore
-}
-
-func (r *RemoteDatastoreAdapter) Iterator(ctx interface{}, prefix interface{}, keysOnly bool) (<-chan datastore.KeyValue, <-chan error, error) {
-	// Для удаленного датастора используем ListKeys и создаем channel
-	keys, err := r.RemoteDatastore.ListKeys(ctx.(interface{ Deadline() (interface{}, bool) }),
-		prefix.(string), keysOnly, 0)
+	url := c.baseURL + "/api/v1" + endpoint
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
-	kvChan := make(chan datastore.KeyValue, len(keys))
-	errChan := make(chan error, 1)
-
-	go func() {
-		defer close(kvChan)
-		defer close(errChan)
-
-		for _, item := range keys {
-			if keysOnly {
-				if keyStr, ok := item.(string); ok {
-					kvChan <- datastore.KeyValue{
-						Key: datastore.NewKey(keyStr),
-					}
-				}
-			} else {
-				if keyInfo, ok := item.(map[string]interface{}); ok {
-					if keyStr, ok := keyInfo["key"].(string); ok {
-						valueStr := ""
-						if val, ok := keyInfo["value"].(string); ok {
-							valueStr = val
-						}
-						kvChan <- datastore.KeyValue{
-							Key:   datastore.NewKey(keyStr),
-							Value: []byte(valueStr),
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	return kvChan, errChan, nil
-}
-
-func (r *RemoteDatastoreAdapter) ListKeys(ctx interface{}, prefix string, keysOnly bool, limit int) ([]interface{}, error) {
-	return r.RemoteDatastore.ListKeys(ctx.(interface{ Deadline() (interface{}, bool) }), prefix, keysOnly, limit)
-}
-
-func (r *RemoteDatastoreAdapter) Search(ctx interface{}, query string, caseSensitive, keysOnly bool, limit int) ([]interface{}, error) {
-	return r.RemoteDatastore.Search(ctx.(interface{ Deadline() (interface{}, bool) }), query, caseSensitive, keysOnly, limit)
-}
-
-func (r *RemoteDatastoreAdapter) GetStats(ctx interface{}) (map[string]interface{}, error) {
-	return r.RemoteDatastore.GetStats(ctx.(interface{ Deadline() (interface{}, bool) }))
-}
-
-func (r *RemoteDatastoreAdapter) Clear(ctx context.Context) error {
-	return r.RemoteDatastore.Clear(ctx)
-}
-
-func (r *RemoteDatastoreAdapter) CreateJSSubscription(ctx interface{}, id, script string, config *datastore.JSSubscriberConfig) error {
-	return r.RemoteDatastore.CreateJSSubscription(ctx.(interface{ Deadline() (interface{}, bool) }), id, script, config)
-}
-
-func (r *RemoteDatastoreAdapter) RemoveJSSubscription(ctx interface{}, id string) error {
-	return r.RemoteDatastore.RemoveJSSubscription(ctx.(interface{ Deadline() (interface{}, bool) }), id)
-}
-
-func (r *RemoteDatastoreAdapter) ListJSSubscriptions(ctx interface{}) ([]datastore.SavedJSSubscription, error) {
-	return r.RemoteDatastore.ListJSSubscriptions(ctx.(interface{ Deadline() (interface{}, bool) }))
-}
-
-// CollectGarbage is a no-op for RemoteDatastore
-func (r *RemoteDatastoreAdapter) CollectGarbage(ctx context.Context) error {
-	// No-op for remote datastore
-	return nil
-}
-
-func (r *RemoteDatastoreAdapter) Merge(ctx context.Context, other datastore.Datastore) error {
-	// No-op for remote datastore
-	return nil
-}
-
-func (r *RemoteDatastoreAdapter) Close() error {
-	return r.RemoteDatastore.Close()
-}
-
-// CreateFilteredJSSubscription creates a JS subscription with event filters
-func (s *RemoteDatastoreAdapter) CreateFilteredJSSubscription(ctx context.Context, id, script string, eventTypes ...EventType) error {
-	config := &datastore.JSSubscriberConfig{
-		ExecutionTimeout: 5 * time.Second,
-		EnableNetworking: true,
-		EnableLogging:    true,
-		EventFilters:     eventTypes,
-		StrictMode:       false,
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	return s.CreateJSSubscription(ctx, id, script, config)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	_, err = io.Copy(writer, resp.Body)
+	return err
 }
