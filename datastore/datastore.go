@@ -71,6 +71,7 @@ type Datastore interface {
 	EnableTTLMonitoring(config *TTLMonitorConfig) error
 	DisableTTLMonitoring() error
 	GetTTLMonitorConfig() *TTLMonitorConfig
+	GetTTLStats(ctx context.Context, prefix ds.Key) (*TTLStats, error)
 	//
 	// Методы стримминга
 	StreamTo(ctx context.Context, writer io.Writer, opts *StreamOptions) error

@@ -803,3 +803,7 @@ func (r *RemoteDatastoreAdapter) Sync(ctx context.Context, prefix ds.Key) error 
 	// Для удаленного датастора синхронизация происходит автоматически
 	return nil
 }
+
+func (r *RemoteDatastoreAdapter) GetTTLStats(ctx context.Context, prefix ds.Key) (*TTLStats, error) {
+	return r.client.GetTTLStats(ctx, prefix)
+}

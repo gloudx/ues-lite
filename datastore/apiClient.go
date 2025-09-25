@@ -871,3 +871,29 @@ func (c *APIClient) StreamTo(ctx context.Context, writer io.Writer, opts *Stream
 	_, err = io.Copy(writer, resp.Body)
 	return err
 }
+
+func (c *APIClient) GetTTLStats(ctx context.Context, prefix ds.Key) (*TTLStats, error) {
+	endpoint := "/ttl/stats"
+	if prefix.String() != "" {
+		endpoint += fmt.Sprintf("?prefix=%s", prefix.String())
+	}
+
+	apiResp, err := c.get(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	var stats TTLStats
+	if data, ok := apiResp.Data.(map[string]interface{}); ok {
+		bytes, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(bytes, &stats); err != nil {
+			return nil, err
+		}
+		return &stats, nil
+	}
+
+	return nil, fmt.Errorf("неожиданный формат ответа")
+}
