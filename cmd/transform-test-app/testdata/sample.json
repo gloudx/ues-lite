@@ -1,0 +1,23 @@
+[
+  {
+    "key": "item1",
+    "value": {
+      "name": "Sample Item 1",
+      "description": "This is the first sample item."
+    }
+  },
+  {
+    "key": "item2",
+    "value": {
+      "name": "Sample Item 2",
+      "description": "This is the second sample item."
+    }
+  },
+  {
+    "key": "item3",
+    "value": {
+      "name": "Sample Item 3",
+      "description": "This is the third sample item."
+    }
+  }
+]

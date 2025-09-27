@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	s "ues-lite/datastore"
 
@@ -12,9 +15,12 @@ import (
 	bstor "github.com/ipfs/boxo/blockstore"
 	chunker "github.com/ipfs/boxo/chunker"
 	"github.com/ipfs/boxo/files"
+	"github.com/ipfs/boxo/filestore"
 	"github.com/ipfs/boxo/ipld/merkledag"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	imp "github.com/ipfs/boxo/ipld/unixfs/importer"
+	h "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
+	trickle "github.com/ipfs/boxo/ipld/unixfs/importer/trickle"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	"github.com/ipfs/go-cid"
 	format "github.com/ipfs/go-ipld-format"
@@ -51,9 +57,12 @@ type Blockstore interface {
 	bstor.Viewer
 	io.Closer
 	Datastore() s.Datastore
+	//
 	PutNode(ctx context.Context, n datamodel.Node) (cid.Cid, error)
+	PutFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error)
+	AddFile(ctx context.Context, filePath string) (cid.Cid, error)
+	//
 	GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, error)
-	AddFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error)
 	GetFile(ctx context.Context, c cid.Cid) (files.Node, error)
 	GetReader(ctx context.Context, c cid.Cid) (io.ReadSeekCloser, error)
 	Walk(ctx context.Context, root cid.Cid, visit func(p traversal.Progress, n datamodel.Node) error) error
@@ -64,30 +73,54 @@ type Blockstore interface {
 }
 
 type blockstore struct {
-	ds s.Datastore
 	bstor.Blockstore
+	ds   s.Datastore
 	lsys *linking.LinkSystem
 	bS   blockservice.BlockService
 	dS   format.DAGService
-	mu   sync.RWMutex
+	fs   *filestore.Filestore
+	fm   *filestore.FileManager
 }
 
 var _ Blockstore = (*blockstore)(nil)
 
-func NewBlockstore(ds s.Datastore) *blockstore {
-	base := bstor.NewBlockstore(ds)
-	bs := &blockstore{
-		ds:         ds,
-		Blockstore: base,
+func NewBlockstore(ds s.Datastore, fileRoot string) *blockstore {
+
+	absPath, err := filepath.Abs(fileRoot)
+	if err != nil {
+		log.Fatal("Ошибка получения абсолютного пути:", err)
 	}
-	bs.mu = sync.RWMutex{}
-	bs.bS = blockservice.New(bs.Blockstore, nil)
+
+	if err := os.MkdirAll(absPath, 0755); err != nil {
+		panic(fmt.Sprintf("не удалось создать корневой каталог для filestore: %v", err))
+	}
+
+	base := bstor.NewBlockstore(ds)
+
+	fm := filestore.NewFileManager(ds, absPath, func(fm *filestore.FileManager) {
+		fm.AllowFiles = true
+	})
+
+	bs := &blockstore{
+		Blockstore: base,
+		ds:         ds,
+	}
+
+	bs.fs = filestore.NewFilestore(bs, fm)
+	bs.fm = fm
+
+	bs.bS = blockservice.New(bs.fs, nil)
+
 	bs.dS = merkledag.NewDAGService(bs.bS)
+
 	adapter := &bsrvadapter.Adapter{Wrapped: bs.bS}
 	lS := cidlink.DefaultLinkSystem()
 	lS.SetWriteStorage(adapter)
 	lS.SetReadStorage(adapter)
 	bs.lsys = &lS
+
+	bs.fm = fm
+
 	return bs
 }
 
@@ -111,7 +144,7 @@ func (bs *blockstore) GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, e
 	return bs.lsys.Load(ipld.LinkContext{Ctx: ctx}, lnk, basicnode.Prototype.Any)
 }
 
-func (bs *blockstore) AddFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error) {
+func (bs *blockstore) PutFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error) {
 	var spl chunker.Splitter
 	if useRabin {
 		spl = chunker.NewRabinMinMax(data, RabinMinSize, DefaultChunkSize, RabinMaxSize)
@@ -123,6 +156,40 @@ func (bs *blockstore) AddFile(ctx context.Context, data io.Reader, useRabin bool
 		return cid.Undef, err
 	}
 	return nd.Cid(), nil
+}
+
+func (bs *blockstore) AddFile(ctx context.Context, filePath string) (cid.Cid, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("не удалось открыть файл: %v", err)
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return cid.Undef, fmt.Errorf("не удалось получить информацию о файле: %v", err)
+	}
+	f, err := files.NewReaderPathFile(filePath, file, stat)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("не удалось создать files.File: %v", err)
+	}
+	defer f.Close()
+	spl := chunker.NewSizeSplitter(f, DefaultChunkSize)
+	dbp := h.DagBuilderParams{
+		Dagserv:   bs.dS,
+		Maxlinks:  h.DefaultLinksPerBlock,
+		NoCopy:    true,
+		RawLeaves: true,
+	}
+	dbh, err := dbp.New(spl)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("не удалось создать DagBuilder: %v", err)
+	}
+	n, err := trickle.Layout(dbh)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("не удалось создать DAG: %v", err)
+	}
+	fmt.Printf("Файл '%s' (размер: %d байт) успешно добавлен в IPFS\n", filepath.Base(filePath), stat.Size())
+	return n.Cid(), nil
 }
 
 func (bs *blockstore) GetFile(ctx context.Context, c cid.Cid) (files.Node, error) {
@@ -141,6 +208,22 @@ func (bs *blockstore) GetReader(ctx context.Context, c cid.Cid) (io.ReadSeekClos
 	return ufsio.NewDagReader(ctx, nd, bs.dS)
 }
 
+func (bs *blockstore) ListAll(ctx context.Context) (func(context.Context) *filestore.ListRes, error) {
+	return filestore.ListAll(ctx, bs.fs, false)
+}
+
+func (bs *blockstore) VerifyAll(ctx context.Context) (func(context.Context) *filestore.ListRes, error) {
+	return filestore.VerifyAll(ctx, bs.fs, false)
+}
+
+func (bs *blockstore) List(ctx context.Context, key cid.Cid) *filestore.ListRes {
+	return filestore.List(ctx, bs.fs, key)
+}
+
+func (bs *blockstore) Verify(ctx context.Context, key cid.Cid) *filestore.ListRes {
+	return filestore.Verify(ctx, bs.fs, key)
+}
+
 func (bs *blockstore) View(ctx context.Context, id cid.Cid, callback func([]byte) error) error {
 	if v, ok := bs.Blockstore.(bstor.Viewer); ok {
 		return v.View(ctx, id, callback)
@@ -152,7 +235,7 @@ func (bs *blockstore) View(ctx context.Context, id cid.Cid, callback func([]byte
 	return callback(blk.RawData())
 }
 
-func _BuildSelectorNodeExploreAll() datamodel.Node {
+func buildSelectorNodeExploreAll() datamodel.Node {
 	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
 	return sb.ExploreRecursive(
 		selector.RecursionLimitNone(),
